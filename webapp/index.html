@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Семейный бюджет</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <h1 id="screen-title">Главная</h1>
+  </header>
+
+  <main id="screen-home" class="screen">
+    <section class="card accent">
+      <div class="card-row">
+        <span class="label">Общий остаток</span>
+        <span class="value" id="shared-remaining">—</span>
+      </div>
+      <div class="sub" id="shared-breakdown">—</div>
+    </section>
+
+    <section class="card">
+      <div class="card-row">
+        <span class="label">Мой личный бюджет</span>
+        <span class="value" id="personal-remaining">—</span>
+      </div>
+      <div class="sub" id="personal-breakdown">—</div>
+      <div class="budget-form">
+        <input id="budget-input" type="text" inputmode="decimal" placeholder="10000 или +500 / -300">
+        <button id="budget-submit">Задать</button>
+      </div>
+      <div class="hint" id="budget-hint"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-row">
+        <span class="label">Потрачено сегодня</span>
+        <span class="value" id="today-total">—</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">Бюджеты всех</div>
+      <div id="all-budgets" class="list"></div>
+    </section>
+  </main>
+
+  <main id="screen-expenses" class="screen hidden">
+    <div class="tabs">
+      <button class="tab active" data-scope="period">Период</button>
+      <button class="tab" data-scope="today">Сегодня</button>
+    </div>
+    <div class="total-line" id="expenses-total"></div>
+    <div id="expenses-list" class="list"></div>
+  </main>
+
+  <main id="screen-categories" class="screen hidden">
+    <div class="tabs">
+      <button class="tab active" data-view="period">Текущий период</button>
+      <button class="tab" data-view="months">По месяцам</button>
+    </div>
+    <div id="categories-period"></div>
+    <div id="categories-months" class="hidden"></div>
+  </main>
+
+  <main id="screen-shopping" class="screen hidden">
+    <div id="shopping-list" class="list"></div>
+    <div class="shopping-form">
+      <input id="shopping-input" type="text" placeholder="Что добавить (через запятую)">
+      <button id="shopping-add">Добавить</button>
+    </div>
+    <button id="shopping-clear-done" class="secondary">Убрать выполненное</button>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-screen="home">🏠<span>Главная</span></button>
+    <button class="nav-btn" data-screen="expenses">🧾<span>Расходы</span></button>
+    <button class="nav-btn" data-screen="categories">📊<span>Категории</span></button>
+    <button class="nav-btn" data-screen="shopping">🛒<span>Покупки</span></button>
+  </nav>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>
