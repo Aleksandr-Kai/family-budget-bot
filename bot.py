@@ -1,14 +1,18 @@
+import asyncio
 import calendar
+import contextvars
 import html
 import json
 import logging
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from telegram import (
     BotCommand,
@@ -39,6 +43,131 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+# Пауз между повторными попытками при перегрузке Gemini (503) — сама
+# перегрузка почти всегда временная (со стороны Google), поэтому вместо
+# немедленного отказа ждём и пробуем снова, пока не кончатся попытки.
+GEMINI_RETRY_DELAYS = [5, 15, 30, 60, 60]
+
+# Устанавливается в main() после создания Application — нужен, чтобы
+# отправить уведомление о повторных попытках из generate_content_with_retry,
+# куда chat_id/context не прокидываются explicitно (см. current_chat_id).
+telegram_bot = None
+
+# ContextVar вместо явного параметра — так все вложенные Gemini-вызовы внутри
+# обработки одного сообщения (парсинг, категория, сверка списка покупок и
+# т.д.) знают, кому писать, без изменения сигнатур всех промежуточных
+# функций. Выставляется в начале handle_text/handle_photo/handle_voice.
+current_chat_id: contextvars.ContextVar = contextvars.ContextVar(
+    "current_chat_id", default=None
+)
+
+_last_retry_notice: dict = {}
+RETRY_NOTICE_DEBOUNCE_SECONDS = 20
+
+# Пока не ноль — Gemini упёрся в лимит запросов (HTTP 429, RESOURCE_EXHAUSTED)
+# и все вызовы должны сразу отказывать без похода в сеть, до этого момента
+# (time.monotonic()). Лимит минутный (free tier), поэтому отдельно от 503 —
+# здесь нет смысла повторять попытку раньше, чем Google сам разрешит.
+_llm_cooldown_until = 0.0
+
+
+class LLMRateLimited(Exception):
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"Gemini: превышен лимit запросов, повтор через {retry_after:.0f}с")
+
+
+def _extract_retry_delay(details) -> float:
+    """Достаёт retryDelay (в секундах) из тела ошибки 429, если Google его
+    прислал; иначе разумное значение по умолчанию."""
+    try:
+        for d in details.get("error", {}).get("details", []):
+            if d.get("@type", "").endswith("RetryInfo"):
+                delay = d.get("retryDelay", "")
+                if delay.endswith("s"):
+                    return float(delay[:-1])
+    except Exception:
+        pass
+    return 60.0
+
+
+async def _notify_rate_limited(retry_after: float):
+    chat_id = current_chat_id.get()
+    if chat_id is None or telegram_bot is None:
+        return
+    now = time.monotonic()
+    if now - _last_retry_notice.get(chat_id, 0) < RETRY_NOTICE_DEBOUNCE_SECONDS:
+        return
+    _last_retry_notice[chat_id] = now
+    try:
+        await telegram_bot.send_message(
+            chat_id,
+            f"🚦 Gemini достиг лимита запросов в минуту. Подожду {int(retry_after) + 1}с, "
+            "пока лимит сбросится — до этого момента ИИ-распознавание временно недоступно, "
+            "попробуйте отправить сообщение ещё раз чуть позже.",
+        )
+    except Exception:
+        logger.exception("Не удалось отправить уведомление о лимите Gemini")
+
+
+async def _notify_retry_in_progress():
+    """Сообщает пользователю, что запрос не потерян — просто Gemini сейчас
+    недоступен и бот пробует снова. С debounce, чтобы при нескольких
+    параллельных Gemini-вызовах (например, категории для нескольких позиций
+    чека) не прислать несколько одинаковых уведомлений подряд."""
+    chat_id = current_chat_id.get()
+    if chat_id is None or telegram_bot is None:
+        return
+    now = time.monotonic()
+    if now - _last_retry_notice.get(chat_id, 0) < RETRY_NOTICE_DEBOUNCE_SECONDS:
+        return
+    _last_retry_notice[chat_id] = now
+    try:
+        await telegram_bot.send_message(
+            chat_id,
+            "⏳ Gemini сейчас перегружен и не отвечает. Запрос не потерян — "
+            "пробую ещё раз, сообщу, как только обработается.",
+        )
+    except Exception:
+        logger.exception("Не удалось отправить уведомление о повторной попытке")
+
+
+async def generate_content_with_retry(**kwargs):
+    """Обёртка над gemini_client.aio.models.generate_content.
+
+    При HTTP 503 (модель перегружена) — повторяет попытку с паузами.
+    При HTTP 429 (лимит запросов исчерпан) — не повторяет вообще: включает
+    общий кулдаун на указанное Google время, и все вызовы (в том числе из
+    других обработчиков) до его истечения сразу отказывают без обращения к
+    сети. Любая другая ошибка пробрасывается сразу."""
+    global _llm_cooldown_until
+    now = time.monotonic()
+    if now < _llm_cooldown_until:
+        remaining = _llm_cooldown_until - now
+        await _notify_rate_limited(remaining)
+        raise LLMRateLimited(remaining)
+
+    delays = [0] + GEMINI_RETRY_DELAYS
+    for i, delay in enumerate(delays):
+        if delay:
+            logger.warning("Gemini вернул 503, повтор через %sс (попытка %s/%s)", delay, i + 1, len(delays))
+            await _notify_retry_in_progress()
+            await asyncio.sleep(delay)
+        try:
+            return await gemini_client.aio.models.generate_content(**kwargs)
+        except genai_errors.ClientError as e:
+            if e.code != 429:
+                raise
+            retry_after = _extract_retry_delay(e.details)
+            _llm_cooldown_until = time.monotonic() + retry_after
+            logger.warning("Gemini: лимит запросов исчерпан, кулдаун на %.0fс", retry_after)
+            await _notify_rate_limited(retry_after)
+            raise LLMRateLimited(retry_after)
+        except genai_errors.ServerError as e:
+            if e.code != 503 or i == len(delays) - 1:
+                raise
+            continue
+
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID")) if os.getenv("ADMIN_CHAT_ID") else None
 
 # Временный адрес туннеля для экспериментального HTML-отчёта (Mini App).
@@ -50,9 +179,20 @@ CANCEL_KEYBOARD = ReplyKeyboardMarkup(
     [[CANCEL_TEXT]], resize_keyboard=True, one_time_keyboard=True
 )
 
+# Постоянная (не one-time) кнопка-ярлык для быстрого доступа к списку
+# покупок — показывается, пока список не пуст, и прячется, когда он
+# опустошается.
+SHOPPING_LIST_BUTTON_TEXT = "🛒 Список покупок"
+REMOVE_DONE_BUTTON_TEXT = "🧹 Убрать выполненное"
+
 MONTHS_GEN = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+MONTHS_NOM = [
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
 ]
 
 logging.basicConfig(
@@ -151,7 +291,7 @@ async def parse_with_gemini(text: str):
     if not gemini_client:
         return None
     try:
-        response = await gemini_client.aio.models.generate_content(
+        response = await generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=text,
             config=genai_types.GenerateContentConfig(
@@ -188,7 +328,7 @@ async def parse_image_with_gemini(image_bytes: bytes, mime_type: str = "image/jp
         return None
     try:
         image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-        response = await gemini_client.aio.models.generate_content(
+        response = await generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=[image_part],
             config=genai_types.GenerateContentConfig(
@@ -218,7 +358,7 @@ async def transcribe_voice_with_gemini(audio_bytes: bytes, mime_type: str = "aud
         return None
     try:
         audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
-        response = await gemini_client.aio.models.generate_content(
+        response = await generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=[audio_part],
             config=genai_types.GenerateContentConfig(
@@ -231,12 +371,16 @@ async def transcribe_voice_with_gemini(audio_bytes: bytes, mime_type: str = "aud
         return None
 
 
-CATEGORIES = ["Продукты", "Кафе", "Транспорт", "Дом", "Здоровье", "Личное", "Собака", "Другое"]
+CATEGORIES = ["Продукты", "Кафе", "Транспорт", "Дом", "Здоровье", "Личное", "Собака", "Связь", "Другое"]
 
 # Порядок важен: более специфичные категории проверяются раньше общей
 # "Продукты", иначе случайное совпадение подстроки (например, "рис" внутри
 # "Рисовый сендвич") перетягивает результат не туда.
 CATEGORY_KEYWORDS = {
+    "Связь": [
+        "связь", "интернет", "мобильн", "тариф", "мегаком", "o!", "beeline",
+        "билайн",
+    ],
     "Кафе": [
         "кофе", "латте", "кафе", "столовая", "ресторан", "сендвич",
         "пирожн", "тарталетк", "капучино", "обед", "ужин", "завтрак",
@@ -299,7 +443,7 @@ async def classify_category_with_gemini(description: str) -> str:
     if not gemini_client:
         return "Другое"
     try:
-        response = await gemini_client.aio.models.generate_content(
+        response = await generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=description,
             config=genai_types.GenerateContentConfig(
@@ -363,7 +507,7 @@ async def match_shopping_items_with_gemini(text: str, items: list) -> list:
     numbered = "\n".join(f"{i + 1}. {name}" for i, (_, name) in enumerate(items))
     prompt = f"Список покупок:\n{numbered}\n\nТекст: {text}"
     try:
-        response = await gemini_client.aio.models.generate_content(
+        response = await generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=prompt,
             config=genai_types.GenerateContentConfig(
@@ -383,6 +527,53 @@ async def match_shopping_items_with_gemini(text: str, items: list) -> list:
     except Exception:
         logger.exception("Ошибка обращения к Gemini API (сверка списка покупок)")
         return []
+
+
+# Быстрый локальный путь для самых очевидных случаев — чтобы не дёргать
+# Gemini на каждое "удали из списка выполненные".
+DELETE_ALL_DONE_WORDS = {
+    "выполненные", "выполненное", "выполненный", "выполненных", "выполнено",
+}
+
+DELETE_ALL_DONE_SCHEMA = genai_types.Schema(
+    type=genai_types.Type.OBJECT,
+    properties={
+        "is_all_done": genai_types.Schema(type=genai_types.Type.BOOLEAN),
+    },
+    required=["is_all_done"],
+)
+
+DELETE_ALL_DONE_INSTRUCTION = (
+    "Пользователь пишет боту учёта покупок фразу после слов 'удали из "
+    "списка'. Определи: это просьба удалить ЦЕЛИКОМ все уже "
+    "купленные/выполненные пункты списка (например 'выполненные', "
+    "'купленное', 'купленные вещи', 'то что уже купили', 'готовое') — тогда "
+    "is_all_done = true. Если названы конкретные товары для удаления "
+    "(например 'молоко и хлеб') — is_all_done = false."
+)
+
+
+async def is_delete_all_done_request(text: str) -> bool:
+    normalized = text.strip(" .").lower()
+    if normalized in DELETE_ALL_DONE_WORDS:
+        return True
+    if not gemini_client:
+        return False
+    try:
+        response = await generate_content_with_retry(
+            model=GEMINI_MODEL,
+            contents=text,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=DELETE_ALL_DONE_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=DELETE_ALL_DONE_SCHEMA,
+            ),
+        )
+        data = json.loads(response.text)
+        return bool(data.get("is_all_done", False))
+    except Exception:
+        logger.exception("Ошибка обращения к Gemini API (удаление выполненных)")
+        return False
 
 
 NOMINATIVE_SCHEMA = genai_types.Schema(
@@ -413,7 +604,7 @@ async def normalize_items_to_nominative(items: list) -> list:
         return items
     try:
         prompt = "\n".join(f"{i + 1}. {it}" for i, it in enumerate(items))
-        response = await gemini_client.aio.models.generate_content(
+        response = await generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=prompt,
             config=genai_types.GenerateContentConfig(
@@ -605,6 +796,39 @@ def list_pending_requests():
     return rows
 
 
+def get_broadcast_chat_ids() -> list:
+    """Все чаты, которым можно писать рассылкой: одобренные пользователи
+    плюс администратор (у него доступ не через access_requests)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT chat_id FROM access_requests WHERE status = 'approved'"
+    ).fetchall()
+    conn.close()
+    chat_ids = {r["chat_id"] for r in rows}
+    if ADMIN_CHAT_ID is not None:
+        chat_ids.add(ADMIN_CHAT_ID)
+    return list(chat_ids)
+
+
+async def broadcast_message(text: str, reply_markup=None, parse_mode=None):
+    if telegram_bot is None:
+        return
+    for chat_id in get_broadcast_chat_ids():
+        try:
+            await telegram_bot.send_message(
+                chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode
+            )
+        except Exception:
+            logger.exception("Не удалось отправить рассылку в чат %s", chat_id)
+
+
+async def notify_if_shopping_list_cleared():
+    """Если список покупок только что полностью опустел, убирает кнопку
+    "Список покупок" у всех рассылкой."""
+    if shopping_list_is_empty():
+        await broadcast_message("✅ Список покупок пуст.", reply_markup=ReplyKeyboardRemove())
+
+
 def get_period_day() -> int:
     conn = get_conn()
     row = conn.execute("SELECT day FROM period_settings WHERE id = 1").fetchone()
@@ -641,6 +865,7 @@ def current_period_start() -> str:
 
 
 def set_personal_budget(chat_id: int, amount: float, display_name_: str = None):
+    previous = get_personal_budget(chat_id)
     conn = get_conn()
     conn.execute(
         """INSERT INTO personal_budget (chat_id, amount, start_date, display_name)
@@ -651,6 +876,13 @@ def set_personal_budget(chat_id: int, amount: float, display_name_: str = None):
     )
     conn.commit()
     conn.close()
+    logger.info(
+        "Изменение личного бюджета: chat_id=%s, кто=%s, было=%s, стало=%s",
+        chat_id,
+        display_name_,
+        previous["amount"] if previous else None,
+        amount,
+    )
 
 
 def get_personal_budget(chat_id: int):
@@ -661,6 +893,35 @@ def get_personal_budget(chat_id: int):
     ).fetchone()
     conn.close()
     return row
+
+
+def resolve_budget_amount(chat_id: int, raw: str):
+    """Разбирает введённую сумму личного бюджета.
+
+    Если строка начинается с '+' или '-', это изменение уже заданного
+    бюджета на эту величину (например "+500" добавит 500 к текущему).
+    Иначе — новая абсолютная сумма, как раньше.
+
+    Возвращает (amount, error): amount — None, если строка вообще не похожа
+    на число (вызывающий код сам решает, что делать дальше); error — текст
+    ошибки, если число распозналось, но применить его нельзя (изменение без
+    текущего бюджета)."""
+    raw = raw.strip()
+    # "- 4000" (с пробелом после знака) — тоже коррекция на -4000, а не
+    # нераспознанная строка: float() сам по себе пробел не прощает.
+    raw = re.sub(r"^([+-])\s+", r"\1", raw)
+    try:
+        value = float(raw.replace(",", "."))
+    except ValueError:
+        return None, None
+
+    if raw[:1] in ("+", "-"):
+        current = get_personal_budget(chat_id)
+        if not current:
+            return None, "Личный бюджет ещё не задан — сначала укажите точную сумму, без + или -."
+        return current["amount"] + value, None
+
+    return value, None
 
 
 def get_all_personal_budgets():
@@ -763,10 +1024,32 @@ def add_shopping_items(items: list, added_by: str):
 
 
 def get_shopping_list():
+    # Выполненные (вычёркнутые) пункты показываем первыми — так все
+    # отмеченные покупки видно сразу сверху, а не вперемешку с остальными.
     conn = get_conn()
-    rows = conn.execute("SELECT id, item, done FROM shopping_list ORDER BY id").fetchall()
+    rows = conn.execute(
+        "SELECT id, item, done FROM shopping_list ORDER BY done DESC, id"
+    ).fetchall()
     conn.close()
     return rows
+
+
+def shopping_keyboard(rows=None) -> ReplyKeyboardMarkup:
+    """Клавиатура для списка покупок: кнопка списка всегда, а кнопка
+    "Убрать выполненное" — только если в списке есть вычёркнутые пункты."""
+    if rows is None:
+        rows = get_shopping_list()
+    buttons = [[SHOPPING_LIST_BUTTON_TEXT]]
+    if any(r["done"] for r in rows):
+        buttons.append([REMOVE_DONE_BUTTON_TEXT])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+
+def shopping_list_is_empty() -> bool:
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) AS c FROM shopping_list").fetchone()["c"]
+    conn.close()
+    return total == 0
 
 
 def clear_shopping_list_if_complete():
@@ -782,6 +1065,19 @@ def clear_shopping_list_if_complete():
     conn.close()
 
 
+def delete_done_shopping_items() -> list:
+    """Удаляет только уже выполненные (зачёркнутые) пункты, не трогая
+    оставшиеся. Возвращает названия удалённых пунктов."""
+    conn = get_conn()
+    rows = conn.execute("SELECT item FROM shopping_list WHERE done = 1").fetchall()
+    names = [r["item"] for r in rows]
+    if names:
+        conn.execute("DELETE FROM shopping_list WHERE done = 1")
+        conn.commit()
+    conn.close()
+    return names
+
+
 def _mark_shopping_ids_done(ids: list):
     if not ids:
         return
@@ -790,13 +1086,21 @@ def _mark_shopping_ids_done(ids: list):
         conn.execute("UPDATE shopping_list SET done = 1 WHERE id = ?", (item_id,))
     conn.commit()
     conn.close()
-    clear_shopping_list_if_complete()
 
 
-async def mark_matching_shopping_items_done(text: str) -> list:
-    """Ищет пункты списка покупок, упомянутые в тексте (описание траты либо
-    произвольный список), и отмечает их выполненными. Возвращает названия
-    отмеченных пунктов.
+def _delete_shopping_ids(ids: list):
+    if not ids:
+        return
+    conn = get_conn()
+    for item_id in ids:
+        conn.execute("DELETE FROM shopping_list WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+
+async def find_matching_shopping_items(text: str) -> list:
+    """Ищет невыполненные пункты списка покупок, соответствующие тексту
+    (описание траты либо произвольный список). Возвращает список (id, item).
 
     Сначала пробует простое совпадение подстрок (быстро и бесплатно), а если
     ничего не нашлось — просит Gemini сопоставить по смыслу: одно и то же
@@ -812,25 +1116,30 @@ async def mark_matching_shopping_items_done(text: str) -> list:
     if not rows:
         return []
 
-    matched_ids = []
-    matched_names = []
+    matched = []
     for r in rows:
         item_lower = r["item"].strip().lower()
         if item_lower and (item_lower in text_lower or text_lower in item_lower):
-            matched_ids.append(r["id"])
-            matched_names.append(r["item"])
+            matched.append((r["id"], r["item"]))
 
-    if not matched_ids and gemini_client:
+    if not matched and gemini_client:
         items = [(r["id"], r["item"]) for r in rows]
         gemini_ids = await match_shopping_items_with_gemini(text, items)
         id_to_name = {iid: item for iid, item in items}
-        for item_id in gemini_ids:
-            if item_id in id_to_name:
-                matched_ids.append(item_id)
-                matched_names.append(id_to_name[item_id])
+        matched = [(iid, id_to_name[iid]) for iid in gemini_ids if iid in id_to_name]
 
-    _mark_shopping_ids_done(matched_ids)
-    return matched_names
+    return matched
+
+
+async def mark_matching_shopping_items_done(text: str) -> list:
+    """Пункты списка покупок, соответствующие купленному товару, вычёркиваются
+    (не удаляются) — остаются видны в списке, наверху. Если после этого все
+    пункты выполнены, список очищается целиком."""
+    matches = await find_matching_shopping_items(text)
+    _mark_shopping_ids_done([iid for iid, _ in matches])
+    if matches:
+        clear_shopping_list_if_complete()
+    return [name for _, name in matches]
 
 
 async def mark_shopping_items_done_by_names(names: list) -> list:
@@ -838,6 +1147,19 @@ async def mark_shopping_items_done_by_names(names: list) -> list:
     for name in names:
         matched.extend(await mark_matching_shopping_items_done(name))
     return matched
+
+
+async def delete_matching_shopping_items(text: str) -> list:
+    matches = await find_matching_shopping_items(text)
+    _delete_shopping_ids([iid for iid, _ in matches])
+    return [name for _, name in matches]
+
+
+async def delete_shopping_items_by_names(names: list) -> list:
+    deleted = []
+    for name in names:
+        deleted.extend(await delete_matching_shopping_items(name))
+    return deleted
 
 
 def get_spent_since(since: str) -> float:
@@ -1081,6 +1403,8 @@ HELP_TEXT = (
     "  купить молоко, хлеб и яйца — добавить пункты (текстом или голосом, "
     "через запятую или «и»)\n"
     "  выполнено по списку молоко, хлеб — отметить пункты выполненными вручную\n"
+    "  удали из списка молоко, хлеб — убрать пункты без отметки о покупке\n"
+    "  удали из списка выполненные — убрать только уже зачёркнутые пункты\n"
     "При внесении любой траты (текст/голос/фото) бот сам сверяется со списком "
     "и вычёркивает совпавшие пункты. Когда всё куплено — список исчезает.\n\n"
     "Команды:\n"
@@ -1092,6 +1416,7 @@ HELP_TEXT = (
     "/expenses — подробный список расходов за отчётный период\n"
     "/summary — краткий отчёт по категориям и дням\n"
     "/categories — итоги по категориям за весь отчётный период\n"
+    "/months — статистика по месяцам и категориям за всё время\n"
     "/shopping — список запланированных покупок\n\n"
     "Отчётный период общий для всех и начинается заданного числа каждого месяца "
     "(настраивается администратором)."
@@ -1129,18 +1454,40 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"<pre>{table}</pre>", parse_mode=ParseMode.HTML)
 
 
+BUDGET_INPUT_TIMEOUT_SECONDS = 60
+
+
+async def _cancel_budget_wait_after_timeout(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Если пользователь не ответил на запрос суммы бюджета за отведённое
+    время — снимаем режим ожидания сами, чтобы случайное сообщение позже
+    не было принято за ввод бюджета."""
+    await asyncio.sleep(BUDGET_INPUT_TIMEOUT_SECONDS)
+    if not context.user_data.get("awaiting_personal_budget"):
+        return
+    context.user_data.pop("awaiting_personal_budget", None)
+    try:
+        await context.bot.send_message(
+            chat_id,
+            "⌛ Время на ввод суммы бюджета истекло, отменено.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception:
+        logger.exception("Не удалось отправить уведомление об истечении таймаута ввода бюджета")
+
+
 async def mybudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_access(update, context):
         return
     chat_id = update.effective_chat.id
     who = display_name(update.effective_user)
     if context.args:
-        raw = context.args[0].replace(",", ".")
-        try:
-            amount = float(raw)
-        except ValueError:
+        amount, error = resolve_budget_amount(chat_id, context.args[0])
+        if error:
+            await update.message.reply_text(error)
+            return
+        if amount is None:
             await update.message.reply_text(
-                "Не удалось распознать сумму. Пример: /mybudget 10000"
+                "Не удалось распознать сумму. Примеры: /mybudget 10000, /mybudget +500, /mybudget -300"
             )
             return
         context.user_data.pop("awaiting_personal_budget", None)
@@ -1148,8 +1495,10 @@ async def mybudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Личный бюджет: {fmt(amount)}.")
     else:
         context.user_data["awaiting_personal_budget"] = True
+        asyncio.create_task(_cancel_budget_wait_after_timeout(chat_id, context))
         await update.message.reply_text(
-            "Введите сумму вашего личного бюджета:",
+            "Введите сумму вашего личного бюджета (можно со знаком + или -, "
+            "чтобы изменить текущий бюджет на эту величину):",
             reply_markup=CANCEL_KEYBOARD,
         )
 
@@ -1378,6 +1727,54 @@ async def category_totals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_lines_chunked(update, build_category_totals_lines(rows))
 
 
+def build_monthly_category_lines(rows) -> list:
+    """По каждому календарному месяцу (за всё время) — суммы по категориям
+    и итог за месяц."""
+    SUM_W = 6
+    SEP_W = 24
+
+    by_month = {}
+    order = []
+    for r in rows:
+        dt = datetime.fromisoformat(r["created_at"])
+        key = (dt.year, dt.month)
+        if key not in by_month:
+            by_month[key] = {}
+            order.append(key)
+        category = r["category"] or "Другое"
+        by_month[key][category] = by_month[key].get(category, 0.0) + r["amount"]
+
+    lines = [f"{'Сумма':>{SUM_W}} Категория", ""]
+    grand_total = 0.0
+    for year, month in order:
+        lines.append(f"{MONTHS_NOM[month - 1].upper()} {year}")
+        cats = sorted(by_month[(year, month)].items(), key=lambda kv: -kv[1])
+        month_total = 0.0
+        for category, amount in cats:
+            lines.append(f"{fmt(amount):>{SUM_W}} {html.escape(category)}")
+            month_total += amount
+        lines.append("-" * SEP_W)
+        lines.append(f"{fmt(month_total):>{SUM_W}} Итого за месяц")
+        grand_total += month_total
+        lines.append("")
+    lines.append("-" * SEP_W)
+    lines.append(f"Итого: {fmt(grand_total)}")
+
+    return lines
+
+
+async def monthly_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update, context):
+        return
+    rows = get_expenses()
+
+    if not rows:
+        await update.message.reply_text("Расходов пока нет.")
+        return
+
+    await send_lines_chunked(update, build_monthly_category_lines(rows))
+
+
 async def save_candidates_and_reply(
     update: Update,
     chat_id: int,
@@ -1397,17 +1794,27 @@ async def save_candidates_and_reply(
 
     accepted = []
     over_budget = []
-    matched_shopping_items = []
     for tag, amount, description in candidates:
         if remaining is not None and amount > remaining:
             over_budget.append((tag, amount, description))
             continue
-        category = await determine_category(description)
-        add_expense(chat_id, who, amount, description, category)
-        matched_shopping_items.extend(await mark_matching_shopping_items_done(description))
         accepted.append((tag, amount, description))
         if remaining is not None:
             remaining -= amount
+
+    # Категории и сверка со списком покупок дёргают Gemini — делаем это для
+    # всех принятых позиций параллельно, а не по очереди, иначе чек из
+    # нескольких новых товаров обрабатывается минутами.
+    categories = await asyncio.gather(
+        *(determine_category(description) for _, _, description in accepted)
+    )
+    shopping_matches = await asyncio.gather(
+        *(mark_matching_shopping_items_done(description) for _, _, description in accepted)
+    )
+    matched_shopping_items = []
+    for (tag, amount, description), category, matches in zip(accepted, categories, shopping_matches):
+        add_expense(chat_id, who, amount, description, category)
+        matched_shopping_items.extend(matches)
 
     reply_lines = [f"{tag} {fmt(a)} — {d}" for tag, a, d in accepted]
     if failed:
@@ -1431,6 +1838,9 @@ async def save_candidates_and_reply(
     elif remove_keyboard:
         await update.message.reply_text("Хорошо.", reply_markup=reply_markup)
 
+    if matched_shopping_items:
+        await notify_if_shopping_list_cleared()
+
 
 # Голосовая расшифровка не всегда даёт идеально чистый текст — допускаем
 # небольшое вступление перед триггерным словом ("так, купить...", "ещё
@@ -1440,7 +1850,11 @@ BUY_PREFIX_RE = re.compile(
     rf"^{_FILLER}куп(?:ить|и|ите)\b[\s,:;\-–—]*(.+)$", re.IGNORECASE | re.DOTALL
 )
 DONE_LIST_PREFIX_RE = re.compile(
-    rf"^{_FILLER}выполнено по списку\b[\s,:;\-–—]*(.+)$", re.IGNORECASE | re.DOTALL
+    rf"^{_FILLER}(?:выполнено по списку|куплено|купил(?:а)?)\b[\s,:;\-–—]*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+DELETE_PREFIX_RE = re.compile(
+    rf"^{_FILLER}удали(?:ть)? из списка\b[\s,:;\-–—]*(.+)$", re.IGNORECASE | re.DOTALL
 )
 # Разделители пунктов списка: запятая, перенос строки или отдельное слово "и"
 # ("бельевую верёвку и бэйдж" — это два пункта, не один).
@@ -1459,8 +1873,10 @@ async def handle_buy_message(update: Update, who: str, items_text: str):
     items = await normalize_items_to_nominative(items)
     add_shopping_items(items, who)
     lines = "\n".join(f"• {html.escape(i)}" for i in items)
-    await update.message.reply_text(
-        f"Добавлено в список покупок:\n{lines}", parse_mode=ParseMode.HTML
+    await broadcast_message(
+        f"🛒 {who} добавил(а) в список покупок:\n{lines}",
+        reply_markup=shopping_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1469,6 +1885,33 @@ async def handle_done_list_message(update: Update, items_text: str):
     matched = await mark_shopping_items_done_by_names(names)
     if matched:
         await update.message.reply_text("Отмечено как выполнено: " + ", ".join(matched))
+        await notify_if_shopping_list_cleared()
+    else:
+        await update.message.reply_text("Не нашёл совпадений в списке покупок.")
+
+
+async def remove_done_shopping_items_and_reply(update: Update):
+    deleted = delete_done_shopping_items()
+    if deleted:
+        await update.message.reply_text(
+            "Удалены выполненные пункты: " + ", ".join(deleted),
+            reply_markup=shopping_keyboard(),
+        )
+        await notify_if_shopping_list_cleared()
+    else:
+        await update.message.reply_text("Выполненных пунктов пока нет.")
+
+
+async def handle_delete_from_shopping_message(update: Update, items_text: str):
+    if await is_delete_all_done_request(items_text):
+        await remove_done_shopping_items_and_reply(update)
+        return
+
+    names = split_items(items_text)
+    deleted = await delete_shopping_items_by_names(names)
+    if deleted:
+        await update.message.reply_text("Удалено из списка покупок: " + ", ".join(deleted))
+        await notify_if_shopping_list_cleared()
     else:
         await update.message.reply_text("Не нашёл совпадений в списке покупок.")
 
@@ -1494,6 +1937,11 @@ async def process_expense_text(
     m = DONE_LIST_PREFIX_RE.match(stripped)
     if m:
         await handle_done_list_message(update, m.group(1))
+        return
+
+    m = DELETE_PREFIX_RE.match(stripped)
+    if m:
+        await handle_delete_from_shopping_message(update, m.group(1))
         return
 
     saved = []
@@ -1531,32 +1979,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_access(update, context):
         return
     chat_id = update.effective_chat.id
+    current_chat_id.set(chat_id)
     who = display_name(update.effective_user)
     text = update.message.text or ""
 
-    was_awaiting_budget = False
-    if context.user_data.pop("awaiting_personal_budget", None):
-        was_awaiting_budget = True
+    if text.strip() == SHOPPING_LIST_BUTTON_TEXT:
+        await shopping_list_cmd(update, context)
+        return
+
+    if text.strip() == REMOVE_DONE_BUTTON_TEXT:
+        await remove_done_shopping_items_and_reply(update)
+        return
+
+    if context.user_data.get("awaiting_personal_budget"):
         if text.strip() == CANCEL_TEXT:
+            context.user_data.pop("awaiting_personal_budget", None)
             await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
             return
-        try:
-            amount = float(text.replace(",", ".").strip())
-        except ValueError:
-            amount = None
+        amount, error = resolve_budget_amount(chat_id, text)
         if amount is not None:
+            context.user_data.pop("awaiting_personal_budget", None)
             set_personal_budget(chat_id, amount, who)
             await update.message.reply_text(
                 f"Личный бюджет: {fmt(amount)}.", reply_markup=ReplyKeyboardRemove()
             )
             return
-        # Не похоже на чистое число — скорее всего, это уже не ответ на запрос
-        # бюджета, а обычный расход. Не блокируем пользователя, а пробуем
-        # распознать сообщение ниже как обычно (клавиатуру всё равно снимем).
+        # Пока не введут число или не нажмут "Отмена" — остаёмся в режиме
+        # ожидания суммы бюджета. Ни в коем случае не пытаемся распознать
+        # ввод как расход, иначе опечатка в сумме бюджета попадёт в траты.
+        await update.message.reply_text(
+            error or "Не удалось распознать сумму. Введите число (можно со знаком "
+            "+ или -, чтобы изменить текущий бюджет) или нажмите «Отмена».",
+            reply_markup=CANCEL_KEYBOARD,
+        )
+        return
 
-    await process_expense_text(
-        update, context, chat_id, who, text, remove_keyboard=was_awaiting_budget
-    )
+    await process_expense_text(update, context, chat_id, who, text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1577,6 +2035,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    current_chat_id.set(chat_id)
     who = display_name(update.effective_user)
 
     try:
@@ -1617,6 +2076,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("awaiting_personal_budget", None)
 
     chat_id = update.effective_chat.id
+    current_chat_id.set(chat_id)
     who = display_name(update.effective_user)
 
     try:
@@ -1646,7 +2106,9 @@ async def shopping_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows = get_shopping_list()
     if not rows:
-        await update.message.reply_text("Нет запланированных покупок.")
+        await update.message.reply_text(
+            "Нет запланированных покупок.", reply_markup=ReplyKeyboardRemove()
+        )
         return
     lines = []
     for i, r in enumerate(rows, 1):
@@ -1654,7 +2116,9 @@ async def shopping_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r["done"]:
             item_text = f"<s>{item_text}</s>"
         lines.append(item_text)
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=shopping_keyboard(rows)
+    )
 
 
 async def experimental_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1681,6 +2145,7 @@ async def post_init(app: Application):
             BotCommand("expenses", "Расходы за отчётный период"),
             BotCommand("summary", "По дням и категориям"),
             BotCommand("categories", "Итоги по категориям"),
+            BotCommand("months", "Статистика по месяцам"),
             BotCommand("shopping", "Что купить"),
             BotCommand("balance", "Остаток"),
             BotCommand("mybalance", "Мой остаток"),
@@ -1696,6 +2161,7 @@ async def post_init(app: Application):
                 BotCommand("expenses", "Расходы за отчётный период"),
                 BotCommand("summary", "По дням и категориям"),
                 BotCommand("categories", "Итоги по категориям"),
+                BotCommand("months", "Статистика по месяцам"),
                 BotCommand("shopping", "Что купить"),
                 BotCommand("balance", "Остаток"),
                 BotCommand("mybalance", "Мой остаток"),
@@ -1717,7 +2183,19 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    # По умолчанию PTB обрабатывает обновления по одному за раз, поэтому
+    # долгий запрос к Gemini (голосовое, фото чека) от одного пользователя
+    # блокирует ответы на команды других — включаем параллельную обработку.
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    global telegram_bot
+    telegram_bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
@@ -1729,6 +2207,7 @@ def main():
     app.add_handler(CommandHandler("expenses", expenses_list))
     app.add_handler(CommandHandler("summary", expenses_summary))
     app.add_handler(CommandHandler("categories", category_totals))
+    app.add_handler(CommandHandler("months", monthly_stats))
     app.add_handler(CommandHandler("shopping", shopping_list_cmd))
     app.add_handler(CommandHandler("pending", pending_requests))
     app.add_handler(CommandHandler("reportbeta", experimental_report_cmd))
