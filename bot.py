@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime
@@ -820,6 +821,13 @@ def init_db():
         )"""
     )
     conn.execute(
+        """CREATE TABLE IF NOT EXISTS bot_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            admin_chat_id INTEGER,
+            invite_code TEXT
+        )"""
+    )
+    conn.execute(
         """CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE
@@ -924,6 +932,22 @@ def set_access_status(chat_id: int, status: str):
     conn.execute(
         "UPDATE access_requests SET status = ?, decided_at = ? WHERE chat_id = ?",
         (status, datetime.now().isoformat(), chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def grant_access_via_invite(chat_id: int, username: str, full_name: str):
+    """Доступ по приглашению — сразу approved, без ожидания админа."""
+    conn = get_conn()
+    now = datetime.now().isoformat()
+    conn.execute(
+        """INSERT INTO access_requests (chat_id, status, username, full_name, requested_at, decided_at)
+           VALUES (?, 'approved', ?, ?, ?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET
+               status='approved', username=excluded.username,
+               full_name=excluded.full_name, decided_at=excluded.decided_at""",
+        (chat_id, username, full_name, now, now),
     )
     conn.commit()
     conn.close()
@@ -1371,8 +1395,72 @@ def display_name(user) -> str:
     return str(user.id)
 
 
+def get_configured_admin_chat_id():
+    """ADMIN_CHAT_ID из .env, если задан, имеет приоритет (так было у уже
+    работающих установок бота). Если его нет — админ, самостоятельно
+    назначенный через /start при первом запуске (см. bootstrap в start())."""
+    if ADMIN_CHAT_ID is not None:
+        return ADMIN_CHAT_ID
+    conn = get_conn()
+    row = conn.execute("SELECT admin_chat_id FROM bot_settings WHERE id = 1").fetchone()
+    conn.close()
+    return row["admin_chat_id"] if row and row["admin_chat_id"] else None
+
+
+def set_admin_chat_id(chat_id: int):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO bot_settings (id, admin_chat_id) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET admin_chat_id=excluded.admin_chat_id""",
+        (chat_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def is_admin(chat_id: int) -> bool:
-    return ADMIN_CHAT_ID is not None and chat_id == ADMIN_CHAT_ID
+    admin_id = get_configured_admin_chat_id()
+    return admin_id is not None and chat_id == admin_id
+
+
+def get_invite_code() -> str:
+    """Постоянный код приглашения (пока админ не перевыпустит через
+    /invite new). Создаётся лениво при первом запросе."""
+    conn = get_conn()
+    row = conn.execute("SELECT invite_code FROM bot_settings WHERE id = 1").fetchone()
+    if row and row["invite_code"]:
+        code = row["invite_code"]
+        conn.close()
+        return code
+    code = secrets.token_urlsafe(8)
+    conn.execute(
+        """INSERT INTO bot_settings (id, invite_code) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET invite_code=excluded.invite_code""",
+        (code,),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def regenerate_invite_code() -> str:
+    code = secrets.token_urlsafe(8)
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO bot_settings (id, invite_code) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET invite_code=excluded.invite_code""",
+        (code,),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def check_invite_code(code: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT invite_code FROM bot_settings WHERE id = 1").fetchone()
+    conn.close()
+    return bool(row and row["invite_code"] and row["invite_code"] == code)
 
 
 
@@ -1388,6 +1476,7 @@ def access_request_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 
 ADMIN_CONTACT = "@aleksandr_kai"
+REPO_URL = "https://github.com/Aleksandr-Kai/family-budget-bot"
 
 FLYER_TEXT = (
     "👋 Это приватный семейный бот учёта расходов.\n\n"
@@ -1411,7 +1500,13 @@ async def handle_want_own_bot(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     await query.message.reply_text(
-        f"Пишите — помогу настроить: {ADMIN_CONTACT}"
+        "Это открытый проект — поставить себе можно самостоятельно, бесплатно, "
+        "за 10-15 минут, без программирования:\n\n"
+        f"{REPO_URL}\n\n"
+        "Там же — пошаговая инструкция INSTALL.md (получить токен у @BotFather, "
+        "запустить установочный скрипт). Бот сразу персональный — только для "
+        "вашей семьи, никто чужой доступа не получит.\n\n"
+        f"Если что-то не получается — пишите: {ADMIN_CONTACT}"
     )
 
 
@@ -1509,6 +1604,30 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
 
+async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админская команда — присылает ссылку-приглашение в семью. Перешедший
+    по ней сразу получает доступ (без ручного одобрения на каждого).
+    /invite new — перевыпустить ссылку (старая перестанет работать)."""
+    if not is_admin(update.effective_chat.id):
+        await update.message.reply_text("Команда доступна только администратору.")
+        return
+
+    if context.args and context.args[0] == "new":
+        code = regenerate_invite_code()
+        prefix = "Новая ссылка (старая больше не работает):\n\n"
+    else:
+        code = get_invite_code()
+        prefix = "Ссылка-приглашение в семью:\n\n"
+
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start=inv_{code}"
+    await update.message.reply_text(
+        f"{prefix}{link}\n\n"
+        "Перешедший по ней сразу получает доступ к боту. Чтобы ссылка "
+        "перестала работать — /invite new."
+    )
+
+
 async def pending_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
         await update.message.reply_text("Команда доступна только администратору.")
@@ -1554,9 +1673,43 @@ HELP_TEXT = (
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # Самостоятельная установка: если админ ещё не назначен (ни в .env, ни
+    # в базе) — первый, кто напишет боту /start, автоматически им становится.
+    if get_configured_admin_chat_id() is None:
+        set_admin_chat_id(chat_id)
+        await set_admin_command_menu(context.bot, chat_id)
+        await update.message.reply_text(
+            "👋 Это новая установка бота, администратор ещё не назначен — "
+            "теперь это вы.\n\n"
+            "Чтобы позвать остальных членов семьи, отправьте /invite — пришлю "
+            "ссылку, по которой они сразу получат доступ, без вашего "
+            "подтверждения на каждого."
+        )
+        await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
+        return
+
+    # Переход по инвайт-ссылке (t.me/<bot>?start=inv_<code>) — доступ сразу,
+    # без ожидания решения администратора.
+    if context.args and context.args[0].startswith("inv_") and not is_admin(chat_id):
+        if get_access_status(chat_id) != "approved":
+            code = context.args[0][len("inv_"):]
+            if check_invite_code(code):
+                user = update.effective_user
+                grant_access_via_invite(chat_id, user.username, user.first_name)
+                await update.message.reply_text("✅ Вы присоединились по приглашению!")
+            else:
+                await update.message.reply_text("Ссылка-приглашение недействительна.")
+
     if not await ensure_access(update, context):
         return
     await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
+    if is_admin(chat_id):
+        await update.message.reply_text(
+            "Вы администратор. /invite — ссылка для мгновенного доступа "
+            "родным, /pending — заявки тех, кто написал боту без ссылки."
+        )
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2308,22 +2461,29 @@ async def experimental_miniapp_cmd(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def set_admin_command_menu(bot, admin_chat_id: int):
+    """Админский набор слэш-команд, виден только в чате самого админа."""
+    await bot.set_my_commands(
+        [
+            BotCommand("start", "Помощь / главное меню"),
+            BotCommand("invite", "Пригласить в семью"),
+            BotCommand("pending", "Заявки на доступ"),
+            BotCommand("reportbeta", "🧪 Экспериментально: Отчёт"),
+            BotCommand("miniapp", "Открыть мини-приложение"),
+        ],
+        scope=BotCommandScopeChat(chat_id=admin_chat_id),
+    )
+
+
 async def post_init(app: Application):
     # Основная навигация теперь — кнопки главного меню (см.
     # MAIN_MENU_KEYBOARD) и мини-приложение, а не список слэш-команд.
     # Команды оставлены минимально — как резерв для тех, кто печатает их
     # руками, плюс специальные админские, которым нет места среди кнопок.
     await app.bot.set_my_commands([BotCommand("start", "Помощь / главное меню")])
-    if ADMIN_CHAT_ID:
-        await app.bot.set_my_commands(
-            [
-                BotCommand("start", "Помощь / главное меню"),
-                BotCommand("pending", "Заявки на доступ"),
-                BotCommand("reportbeta", "🧪 Экспериментально: Отчёт"),
-                BotCommand("miniapp", "Открыть мини-приложение"),
-            ],
-            scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
-        )
+    admin_chat_id = get_configured_admin_chat_id()
+    if admin_chat_id:
+        await set_admin_command_menu(app.bot, admin_chat_id)
 
     # Кнопка меню (значок рядом с полем ввода) открывает мини-приложение
     # напрямую, а не список команд — если URL не настроен (например, в
@@ -2371,6 +2531,7 @@ def main():
     app.add_handler(CommandHandler("months", monthly_stats))
     app.add_handler(CommandHandler("shopping", shopping_list_cmd))
     app.add_handler(CommandHandler("pending", pending_requests))
+    app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(CommandHandler("reportbeta", experimental_report_cmd))
     app.add_handler(CommandHandler("miniapp", experimental_miniapp_cmd))
     app.add_handler(CommandHandler("join", join_cmd))
