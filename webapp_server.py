@@ -342,7 +342,7 @@ def api_shopping_add():
         bot.broadcast_message(
             f"🛒 {g.display_name} добавил(а) в список покупок:\n"
             + "\n".join(f"• {i}" for i in items),
-            reply_markup=bot.shopping_keyboard(),
+            reply_markup=bot.shopping_clear_done_markup(),
         )
     )
     return jsonify({"added": items})
