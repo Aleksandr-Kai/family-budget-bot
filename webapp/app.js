@@ -160,15 +160,36 @@ document.getElementById("budget-submit").addEventListener("click", async () => {
 // ---------- Расходы ----------
 
 let currentExpenseScope = "period";
+let currentExpenseMode = "detailed";
 
-document.querySelectorAll('#screen-expenses .tab').forEach((tab) => {
+document.querySelectorAll('#screen-expenses [data-scope]').forEach((tab) => {
   tab.addEventListener("click", () => {
-    document.querySelectorAll('#screen-expenses .tab').forEach((t) => t.classList.remove("active"));
+    document.querySelectorAll('#screen-expenses [data-scope]').forEach((t) => t.classList.remove("active"));
     tab.classList.add("active");
     currentExpenseScope = tab.dataset.scope;
     loadExpenses(currentExpenseScope);
   });
 });
+
+document.querySelectorAll('#screen-expenses [data-mode]').forEach((tab) => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll('#screen-expenses [data-mode]').forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+    currentExpenseMode = tab.dataset.mode;
+    loadExpenses(currentExpenseScope);
+  });
+});
+
+function groupExpensesByCategory(items) {
+  const groups = {};
+  items.forEach((item) => {
+    const cat = item.category || "Другое";
+    if (!groups[cat]) groups[cat] = { category: cat, amount: 0, items: [] };
+    groups[cat].amount += item.amount;
+    groups[cat].items.push(item);
+  });
+  return Object.values(groups).sort((a, b) => b.amount - a.amount);
+}
 
 async function loadExpenses(scope) {
   const list = document.getElementById("expenses-list");
@@ -180,6 +201,12 @@ async function loadExpenses(scope) {
       list.innerHTML = '<div class="empty">Расходов пока нет</div>';
       return;
     }
+
+    if (currentExpenseMode === "categories") {
+      renderTotalsList(list, groupExpensesByCategory(data.items));
+      return;
+    }
+
     data.items.forEach((item) => {
       const row = document.createElement("div");
       row.className = "list-row";
