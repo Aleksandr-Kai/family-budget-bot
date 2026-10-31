@@ -20,9 +20,11 @@ import hmac
 import json
 import logging
 import os
+import time
 from functools import wraps
 from urllib.parse import parse_qsl
 
+import httpx
 from flask import Flask, g, jsonify, request, send_from_directory
 
 import bot
@@ -156,6 +158,55 @@ def api_set_period():
         return jsonify({"error": "day должен быть в диапазоне 1-31"}), 400
     bot.set_period_day(day)
     return jsonify({"day": day, "period_start": bot.current_period_start()[:10]})
+
+
+SUPPORTED_CURRENCIES = ["KGS", "USD", "RUB"]
+CURRENCY_SYMBOLS = {"KGS": "с", "USD": "$", "RUB": "₽"}
+RATE_CACHE_TTL = 6 * 3600  # все траты хранятся в сомах, курс нужен только
+# для пересчёта "на лету" при показе — раз в несколько часов достаточно.
+
+_rate_cache = {"ts": 0.0, "rates": {"KGS": 1.0}}
+
+
+def get_rates() -> dict:
+    """Курсы других валют к сому (сколько единиц валюты за 1 сом), с
+    кешем в памяти процесса. При недоступности внешнего API отдаёт
+    последний известный кеш (на старте — только KGS:1)."""
+    now = time.time()
+    if now - _rate_cache["ts"] < RATE_CACHE_TTL and len(_rate_cache["rates"]) > 1:
+        return _rate_cache["rates"]
+    try:
+        resp = httpx.get("https://open.er-api.com/v6/latest/KGS", timeout=5)
+        data = resp.json()
+        if data.get("result") == "success":
+            rates = {"KGS": 1.0}
+            for code in SUPPORTED_CURRENCIES:
+                if code in data.get("rates", {}):
+                    rates[code] = data["rates"][code]
+            _rate_cache["ts"] = now
+            _rate_cache["rates"] = rates
+    except Exception:
+        logger.exception("Не удалось получить курс валют")
+    return _rate_cache["rates"]
+
+
+@app.get("/api/currency")
+@require_auth
+def api_currency():
+    return jsonify({"base": bot.get_base_currency(), "rates": get_rates(), "symbols": CURRENCY_SYMBOLS})
+
+
+@app.post("/api/currency")
+@require_auth
+def api_set_currency():
+    if not bot.is_admin(g.chat_id):
+        return jsonify({"error": "Доступно только администратору"}), 403
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("base", "")).upper()
+    if code not in SUPPORTED_CURRENCIES:
+        return jsonify({"error": "Неизвестная валюта"}), 400
+    bot.set_base_currency(code)
+    return jsonify({"base": code})
 
 
 def _category_totals(rows):

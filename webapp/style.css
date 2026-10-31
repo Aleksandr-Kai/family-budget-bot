@@ -26,10 +26,22 @@ html, body {
 
 .topbar {
   padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 .topbar h1 {
   margin: 0;
   font-size: 1.3rem;
+}
+#currency-view-select {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 0.85rem;
 }
 
 .screen { padding: 0 14px; }

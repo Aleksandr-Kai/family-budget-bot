@@ -12,6 +12,7 @@
 
   <header class="topbar">
     <h1 id="screen-title">Главная</h1>
+    <select id="currency-view-select"></select>
   </header>
 
   <main id="screen-home" class="screen">
@@ -52,6 +53,18 @@
         <button id="period-submit">Сохранить</button>
       </div>
       <div class="hint" id="period-hint"></div>
+
+      <div class="card-title" style="margin-top:14px;">Основная валюта</div>
+      <div class="sub">Всегда отображается в этой валюте; траты по-прежнему вводятся в сомах</div>
+      <div class="budget-form">
+        <select id="base-currency-select">
+          <option value="KGS">Сом (KGS)</option>
+          <option value="USD">Доллар (USD)</option>
+          <option value="RUB">Рубль (RUB)</option>
+        </select>
+        <button id="base-currency-submit">Сохранить</button>
+      </div>
+      <div class="hint" id="base-currency-hint"></div>
     </section>
   </main>
 

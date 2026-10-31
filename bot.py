@@ -814,6 +814,12 @@ def init_db():
         )"""
     )
     conn.execute(
+        """CREATE TABLE IF NOT EXISTS currency_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            base TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
         """CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE
@@ -979,6 +985,27 @@ def set_period_day(day: int):
         """INSERT INTO period_settings (id, day) VALUES (1, ?)
            ON CONFLICT(id) DO UPDATE SET day=excluded.day""",
         (day,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_base_currency() -> str:
+    """Валюта, в которой суммы показываются по умолчанию в мини-аппе. Все
+    траты при этом по-прежнему хранятся и вводятся в сомах (KGS) — это
+    только настройка отображения, конвертация считается на лету."""
+    conn = get_conn()
+    row = conn.execute("SELECT base FROM currency_settings WHERE id = 1").fetchone()
+    conn.close()
+    return row["base"] if row else "KGS"
+
+
+def set_base_currency(code: str):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO currency_settings (id, base) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET base=excluded.base""",
+        (code,),
     )
     conn.commit()
     conn.close()

@@ -24,9 +24,61 @@ async function api(path, options = {}) {
   return data;
 }
 
+// ---------- Валюта ----------
+// Все суммы с сервера приходят в сомах (KGS) — это и есть валюта хранения.
+// baseCurrency — то, что настроено администратором и показывается всегда
+// по умолчанию; viewCurrency — временный переключатель "для просмотра",
+// который не сохраняется и сбрасывается при каждом открытии мини-аппа.
+
+const CURRENCY_LABELS = { KGS: "Сом", USD: "USD", RUB: "RUB" };
+const CURRENCY_DECIMALS = { KGS: 0, USD: 2, RUB: 0 };
+
+let currencyRates = { KGS: 1 };
+let currencySymbols = { KGS: "с", USD: "$", RUB: "₽" };
+let baseCurrency = "KGS";
+let viewCurrency = "KGS";
+
 function fmt(n) {
-  return Math.round(n).toLocaleString("ru-RU");
+  const rate = currencyRates[viewCurrency] || 1;
+  const decimals = CURRENCY_DECIMALS[viewCurrency] ?? 0;
+  const converted = n * rate;
+  const formatted = converted.toLocaleString("ru-RU", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+  const symbol = currencySymbols[viewCurrency] || "";
+  return viewCurrency === "USD" ? `${symbol}${formatted}` : `${formatted} ${symbol}`;
 }
+
+async function loadCurrencyMeta() {
+  try {
+    const data = await api("/api/currency");
+    baseCurrency = data.base;
+    currencyRates = data.rates;
+    currencySymbols = data.symbols || currencySymbols;
+    viewCurrency = baseCurrency;
+  } catch (e) {
+    // нет связи/не авторизован — остаёмся на сомах по умолчанию
+  }
+  populateCurrencySelect();
+}
+
+function populateCurrencySelect() {
+  const sel = document.getElementById("currency-view-select");
+  sel.innerHTML = "";
+  Object.keys(currencyRates).forEach((code) => {
+    const opt = document.createElement("option");
+    opt.value = code;
+    opt.textContent = CURRENCY_LABELS[code] || code;
+    if (code === viewCurrency) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+document.getElementById("currency-view-select").addEventListener("change", (e) => {
+  viewCurrency = e.target.value;
+  showScreen(currentScreen);
+});
 
 function showToast(text) {
   const el = document.getElementById("toast");
@@ -44,7 +96,10 @@ const titles = {
   shopping: "Список покупок",
 };
 
+let currentScreen = "home";
+
 function showScreen(name) {
+  currentScreen = name;
   screens.forEach((s) => {
     document.getElementById(`screen-${s}`).classList.toggle("hidden", s !== name);
   });
@@ -115,6 +170,7 @@ async function loadPeriodSettingsIfAdmin() {
     document.getElementById("period-current").textContent =
       `Сейчас: ${period.day}-е число каждого месяца (текущий период с ${period.period_start})`;
     document.getElementById("period-input").value = period.day;
+    document.getElementById("base-currency-select").value = baseCurrency;
   } catch (e) {
     card.classList.add("hidden");
   }
@@ -131,6 +187,22 @@ document.getElementById("period-submit").addEventListener("click", async () => {
     const res = await api("/api/period", { method: "POST", body: JSON.stringify({ day }) });
     hint.textContent = `Сохранено: ${res.day}-е число, текущий период с ${res.period_start}`;
     loadDashboard();
+  } catch (e) {
+    hint.textContent = e.message;
+    hint.classList.add("error");
+  }
+});
+
+document.getElementById("base-currency-submit").addEventListener("click", async () => {
+  const select = document.getElementById("base-currency-select");
+  const hint = document.getElementById("base-currency-hint");
+  hint.textContent = "";
+  hint.classList.remove("error");
+  try {
+    const res = await api("/api/currency", { method: "POST", body: JSON.stringify({ base: select.value }) });
+    hint.textContent = `Сохранено: ${CURRENCY_LABELS[res.base] || res.base}`;
+    await loadCurrencyMeta();
+    showScreen(currentScreen);
   } catch (e) {
     hint.textContent = e.message;
     hint.classList.add("error");
@@ -453,4 +525,4 @@ document.getElementById("shopping-clear-done").addEventListener("click", async (
 
 // ---------- Старт ----------
 
-showScreen("home");
+loadCurrencyMeta().then(() => showScreen("home"));
