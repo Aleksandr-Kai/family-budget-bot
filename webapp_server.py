@@ -37,13 +37,28 @@ app = Flask(__name__, static_folder=None)
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
 
 
+@app.after_request
+def no_cache(response):
+    # Telegram-клиент на телефоне агрессивно кэширует и статику, и ответы
+    # API — во время отладки это маскирует изменения и создаёт впечатление
+    # "данные не грузятся". Явно запрещаем кэш на всё, пока разрабатываем.
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 def verify_init_data(init_data: str, bot_token: str):
     """Проверяет подпись Telegram.WebApp.initData. Возвращает распарсенные
-    данные (включая user) при успехе, иначе None."""
+    данные (включая user) при успехе, иначе None.
+
+    Важно: поле signature (ed25519-подпись для сторонней проверки без
+    бот-токена) НЕ исключается из data_check_string — Telegram включает его
+    в классическую HMAC-проверку наравне с остальными полями, исключается
+    только сам hash."""
     if not init_data or not bot_token:
         return None
     try:
-        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+        pairs = parse_qsl(init_data, keep_blank_values=True)
     except ValueError:
         return None
     data = dict(pairs)
@@ -120,15 +135,57 @@ def api_me():
     )
 
 
+@app.get("/api/period")
+@require_auth
+def api_period():
+    day = bot.get_period_day()
+    return jsonify({"day": day, "period_start": bot.current_period_start()[:10]})
+
+
+@app.post("/api/period")
+@require_auth
+def api_set_period():
+    if not bot.is_admin(g.chat_id):
+        return jsonify({"error": "Доступно только администратору"}), 403
+    body = request.get_json(silent=True) or {}
+    try:
+        day = int(body.get("day"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "day должен быть числом 1-31"}), 400
+    if not 1 <= day <= 31:
+        return jsonify({"error": "day должен быть в диапазоне 1-31"}), 400
+    bot.set_period_day(day)
+    return jsonify({"day": day, "period_start": bot.current_period_start()[:10]})
+
+
 def _category_totals(rows):
-    totals = {}
+    """Группирует строки расходов по категориям — сумма и сам список
+    трат (новые сверху), чтобы по тапу на категорию показать, что в неё
+    вошло, без отдельного запроса к серверу."""
+    groups = {}
     for r in rows:
         category = r["category"] or "Другое"
-        totals[category] = totals.get(category, 0.0) + r["amount"]
-    return sorted(
-        ({"category": c, "amount": a} for c, a in totals.items()),
-        key=lambda x: -x["amount"],
-    )
+        groups.setdefault(category, []).append(r)
+    totals = []
+    for category, items in groups.items():
+        items_sorted = sorted(items, key=lambda i: i["created_at"], reverse=True)
+        totals.append(
+            {
+                "category": category,
+                "amount": sum(i["amount"] for i in items),
+                "items": [
+                    {
+                        "created_at": i["created_at"],
+                        "amount": i["amount"],
+                        "description": i["description"],
+                        "added_by": i["added_by"],
+                    }
+                    for i in items_sorted
+                ],
+            }
+        )
+    totals.sort(key=lambda x: -x["amount"])
+    return totals
 
 
 @app.get("/api/dashboard")
@@ -145,6 +202,18 @@ def api_dashboard():
     today_start = bot.datetime.now().strftime("%Y-%m-%dT00:00:00")
     today_total = sum(r["amount"] for r in rows if r["created_at"] >= today_start)
 
+    per_person = []
+    for r in bot.get_all_personal_budgets():
+        spent = bot.get_spent_since_by_chat(r["chat_id"], period_start)
+        per_person.append(
+            {
+                "display_name": r["display_name"] or str(r["chat_id"]),
+                "budget": r["amount"],
+                "spent": spent,
+                "remaining": r["amount"] - spent,
+            }
+        )
+
     return jsonify(
         {
             "period_start": period_start[:10],
@@ -155,6 +224,7 @@ def api_dashboard():
             "personal_spent": personal_spent,
             "personal_remaining": (personal["amount"] - personal_spent) if personal else None,
             "today_total": today_total,
+            "per_person": per_person,
         }
     )
 

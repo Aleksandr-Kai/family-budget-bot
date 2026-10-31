@@ -67,11 +67,25 @@ document.querySelectorAll(".nav-btn").forEach((btn) => {
 
 async function loadDashboard() {
   try {
-    const [d, budgets] = await Promise.all([api("/api/dashboard"), api("/api/budgets")]);
+    const d = await api("/api/dashboard");
 
     document.getElementById("shared-remaining").textContent = fmt(d.shared_remaining);
     document.getElementById("shared-breakdown").textContent =
       `Бюджет ${fmt(d.shared_budget_total)} − потрачено ${fmt(d.shared_spent)} (с ${d.period_start})`;
+
+    const perPerson = document.getElementById("per-person-list");
+    perPerson.innerHTML = "";
+    d.per_person.forEach((p) => {
+      const row = document.createElement("div");
+      row.className = "list-row";
+      row.innerHTML = `
+        <div class="desc">
+          <span>${p.display_name}</span>
+          <span class="cat">бюджет ${fmt(p.budget)} · потрачено ${fmt(p.spent)}</span>
+        </div>
+        <span class="amount">${fmt(p.remaining)}</span>`;
+      perPerson.appendChild(row);
+    });
 
     if (d.personal_budget === null) {
       document.getElementById("personal-remaining").textContent = "не задан";
@@ -84,18 +98,46 @@ async function loadDashboard() {
 
     document.getElementById("today-total").textContent = fmt(d.today_total);
 
-    const list = document.getElementById("all-budgets");
-    list.innerHTML = "";
-    budgets.budgets.forEach((b) => {
-      const row = document.createElement("div");
-      row.className = "list-row";
-      row.innerHTML = `<span>${b.display_name || "?"}</span><span class="amount">${fmt(b.amount)}</span>`;
-      list.appendChild(row);
-    });
+    await loadPeriodSettingsIfAdmin();
   } catch (e) {
     showToast(e.message);
   }
 }
+
+async function loadPeriodSettingsIfAdmin() {
+  const card = document.getElementById("period-settings-card");
+  try {
+    const me = await api("/api/me");
+    if (!me.is_admin) {
+      card.classList.add("hidden");
+      return;
+    }
+    const period = await api("/api/period");
+    card.classList.remove("hidden");
+    document.getElementById("period-current").textContent =
+      `Сейчас: ${period.day}-е число каждого месяца (текущий период с ${period.period_start})`;
+    document.getElementById("period-input").value = period.day;
+  } catch (e) {
+    card.classList.add("hidden");
+  }
+}
+
+document.getElementById("period-submit").addEventListener("click", async () => {
+  const input = document.getElementById("period-input");
+  const hint = document.getElementById("period-hint");
+  hint.textContent = "";
+  hint.classList.remove("error");
+  const day = parseInt(input.value, 10);
+  if (!day) return;
+  try {
+    const res = await api("/api/period", { method: "POST", body: JSON.stringify({ day }) });
+    hint.textContent = `Сохранено: ${res.day}-е число, текущий период с ${res.period_start}`;
+    loadDashboard();
+  } catch (e) {
+    hint.textContent = e.message;
+    hint.classList.add("error");
+  }
+});
 
 document.getElementById("budget-submit").addEventListener("click", async () => {
   const input = document.getElementById("budget-input");
@@ -175,10 +217,41 @@ function renderTotalsList(container, totals) {
     return;
   }
   totals.forEach((t) => {
+    const wrap = document.createElement("div");
+    wrap.className = "cat-group";
+
     const row = document.createElement("div");
-    row.className = "list-row";
-    row.innerHTML = `<span>${t.category}</span><span class="amount">${fmt(t.amount)}</span>`;
-    container.appendChild(row);
+    row.className = "list-row cat-row";
+    row.innerHTML = `
+      <span><span class="arrow">▸</span> ${t.category}</span>
+      <span class="amount">${fmt(t.amount)}</span>`;
+
+    const details = document.createElement("div");
+    details.className = "cat-details hidden";
+    details.innerHTML = (t.items || [])
+      .map((i) => {
+        const d = new Date(i.created_at);
+        const dateStr = `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`;
+        return `
+          <div class="list-row cat-item">
+            <div class="desc">
+              <span>${i.description}</span>
+              <span class="cat">${i.added_by || ""} · ${dateStr}</span>
+            </div>
+            <span class="amount">${fmt(i.amount)}</span>
+          </div>`;
+      })
+      .join("");
+
+    row.addEventListener("click", () => {
+      const willShow = details.classList.contains("hidden");
+      details.classList.toggle("hidden", !willShow);
+      row.querySelector(".arrow").textContent = willShow ? "▾" : "▸";
+    });
+
+    wrap.appendChild(row);
+    wrap.appendChild(details);
+    container.appendChild(wrap);
   });
 }
 

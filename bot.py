@@ -10,6 +10,7 @@ import sqlite3
 import time
 from datetime import datetime
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors as genai_errors
@@ -19,8 +20,9 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonDefault,
+    MenuButtonWebApp,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
     WebAppInfo,
 )
@@ -42,6 +44,20 @@ DB_PATH = os.path.join(BASE_DIR, "money_control.db")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# DeepSeek — запасной (или, если задано в .env, основной) провайдер для
+# текстовых ИИ-задач (разбор трат, категории, сверка списка покупок и
+# т.п.). Голос и фото распознаёт только Gemini — у DeepSeek нет мультимодальных
+# моделей, поэтому transcribe_voice_with_gemini/parse_image_with_gemini
+# всегда идут напрямую в Gemini, без выбора провайдера.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+
+# Какой провайдер пробовать первым для текстовых задач: "gemini" (по
+# умолчанию) или "deepseek". Второй, если для него задан ключ, используется
+# как запасной — автоматически, без дополнительной настройки.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 
 # Пауз между повторными попытками при перегрузке Gemini (503) — сама
 # перегрузка почти всегда временная (со стороны Google), поэтому вместо
@@ -168,21 +184,118 @@ async def generate_content_with_retry(**kwargs):
                 raise
             continue
 
+
+async def _call_gemini_json(system_instruction: str, user_content: str, schema):
+    """Текстовый запрос к Gemini со структурированным JSON-ответом по
+    заданной схеме. None — провайдер недоступен (нет ключа) или любая
+    ошибка вызова (включая кулдаун/лимит — уже залогированы внутри
+    generate_content_with_retry)."""
+    if not gemini_client:
+        return None
+    try:
+        response = await generate_content_with_retry(
+            model=GEMINI_MODEL,
+            contents=user_content,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=schema,
+            ),
+        )
+        return json.loads(response.text)
+    except Exception:
+        logger.exception("Ошибка обращения к Gemini API")
+        return None
+
+
+async def _call_deepseek_json(system_instruction: str, user_content: str):
+    """Текстовый запрос к DeepSeek (OpenAI-совместимый chat/completions) с
+    режимом гарантированного JSON-ответа. В отличие от Gemini, DeepSeek не
+    умеет принудительно следовать схеме — формат описывается текстом в
+    system_instruction. None — нет ключа или любая ошибка (сеть, невалидный
+    JSON и т.п.)."""
+    if not DEEPSEEK_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                DEEPSEEK_URL,
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0,
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
+    except Exception:
+        logger.exception("Ошибка обращения к DeepSeek API")
+        return None
+
+
+async def ask_llm_json(system_instruction: str, user_content: str, gemini_schema, deepseek_format_hint: str):
+    """Текстовая ИИ-задача с основным и запасным провайдером.
+
+    Пробует LLM_PROVIDER первым, затем — второго (если для него настроен
+    ключ). Возвращает разобранный JSON (dict) от того, кто первым ответил
+    успешно, или None, если недоступны оба (вызывающий код в этом случае
+    ведёт себя так, будто ИИ вообще нет — как было до DeepSeek)."""
+    deepseek_instruction = (
+        f"{system_instruction}\n\nОтветь строго в виде JSON: {deepseek_format_hint}"
+    )
+    callers = {
+        "gemini": lambda: _call_gemini_json(system_instruction, user_content, gemini_schema),
+        "deepseek": lambda: _call_deepseek_json(deepseek_instruction, user_content),
+    }
+    order = [LLM_PROVIDER] + [p for p in callers if p != LLM_PROVIDER]
+    for provider in order:
+        result = await callers[provider]()
+        if result is not None:
+            return result
+    return None
+
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID")) if os.getenv("ADMIN_CHAT_ID") else None
 
 # Временный адрес туннеля для экспериментального HTML-отчёта (Mini App).
 # Меняется при перезапуске cloudflared — тогда нужно обновить .env.
 EXPERIMENTAL_REPORT_URL = os.getenv("EXPERIMENTAL_REPORT_URL")
+# Mini App (webapp_server.py) — отдельный туннель, отдельная переменная.
+EXPERIMENTAL_MINIAPP_URL = os.getenv("EXPERIMENTAL_MINIAPP_URL")
 
 CANCEL_TEXT = "Отмена"
 CANCEL_KEYBOARD = ReplyKeyboardMarkup(
     [[CANCEL_TEXT]], resize_keyboard=True, one_time_keyboard=True
 )
 
-# Постоянная (не one-time) кнопка-ярлык для быстрого доступа к списку
-# покупок — показывается, пока список не пуст, и прячется, когда он
-# опустошается.
-SHOPPING_LIST_BUTTON_TEXT = "🛒 Список покупок"
+# Главное меню — постоянная клавиатура вместо списка слэш-команд. Показана
+# после /start и восстанавливается после временных клавиатур (отмена ввода
+# бюджета и т.п.), чтобы не пропадала.
+MENU_TODAY = "📅 Расходы сегодня"
+MENU_SUMMARY = "📋 Расходы за период"
+MENU_CATEGORIES = "📊 Итоги по категориям"
+MENU_SHOPPING = "🛒 Список покупок"
+MENU_BUDGET = "💰 Бюджет"
+MENU_SET_BUDGET = "✏️ Задать личный бюджет"
+
+MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [MENU_TODAY, MENU_SUMMARY],
+        [MENU_CATEGORIES, MENU_SHOPPING],
+        [MENU_BUDGET, MENU_SET_BUDGET],
+    ],
+    resize_keyboard=True,
+)
+
+# Кнопка "Убрать выполненное" — инлайн-кнопка под списком покупок (не
+# ломает главное меню-клавиатуру), появляется только если есть вычёркнутые
+# пункты.
+REMOVE_DONE_CALLBACK = "shopping_clear_done"
 REMOVE_DONE_BUTTON_TEXT = "🧹 Убрать выполненное"
 
 MONTHS_GEN = [
@@ -267,8 +380,7 @@ GEMINI_SYSTEM_INSTRUCTION = (
 )
 
 
-def _extract_expenses_from_json(raw_text: str):
-    data = json.loads(raw_text)
+def _extract_expenses_from_json(data: dict):
     result = []
     for e in data.get("expenses", []):
         try:
@@ -281,29 +393,21 @@ def _extract_expenses_from_json(raw_text: str):
     return result
 
 
-async def parse_with_gemini(text: str):
-    """Пытается распознать траты в сложном свободном тексте через Gemini.
+EXPENSE_FORMAT_HINT = '{"expenses": [{"amount": число, "description": "строка"}]}'
 
-    Возвращает список (amount, description) или None, если вызов не удался
-    (нет ключа, ошибка API и т.п.) — тогда вызывающий код должен вести себя
-    так, будто интеграции с Gemini нет.
+
+async def parse_with_gemini(text: str):
+    """Пытается распознать траты в сложном свободном тексте через ИИ
+    (основной и запасной провайдер, см. LLM_PROVIDER/DEEPSEEK_API_KEY).
+
+    Возвращает список (amount, description) или None, если оба провайдера
+    недоступны (нет ключей, ошибка API и т.п.) — тогда вызывающий код
+    должен вести себя так, будто ИИ-интеграции нет.
     """
-    if not gemini_client:
+    data = await ask_llm_json(GEMINI_SYSTEM_INSTRUCTION, text, EXPENSE_SCHEMA, EXPENSE_FORMAT_HINT)
+    if data is None:
         return None
-    try:
-        response = await generate_content_with_retry(
-            model=GEMINI_MODEL,
-            contents=text,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=EXPENSE_SCHEMA,
-            ),
-        )
-        return _extract_expenses_from_json(response.text)
-    except Exception:
-        logger.exception("Ошибка обращения к Gemini API")
-        return None
+    return _extract_expenses_from_json(data)
 
 
 GEMINI_IMAGE_SYSTEM_INSTRUCTION = (
@@ -337,7 +441,7 @@ async def parse_image_with_gemini(image_bytes: bytes, mime_type: str = "image/jp
                 response_schema=EXPENSE_SCHEMA,
             ),
         )
-        return _extract_expenses_from_json(response.text)
+        return _extract_expenses_from_json(json.loads(response.text))
     except Exception:
         logger.exception("Ошибка обращения к Gemini API (изображение)")
         return None
@@ -439,25 +543,15 @@ CATEGORY_SYSTEM_INSTRUCTION = (
 )
 
 
+CATEGORY_FORMAT_HINT = '{"category": "ровно одна из: ' + ", ".join(CATEGORIES) + '"}'
+
+
 async def classify_category_with_gemini(description: str) -> str:
-    if not gemini_client:
+    data = await ask_llm_json(CATEGORY_SYSTEM_INSTRUCTION, description, CATEGORY_SCHEMA, CATEGORY_FORMAT_HINT)
+    if data is None:
         return "Другое"
-    try:
-        response = await generate_content_with_retry(
-            model=GEMINI_MODEL,
-            contents=description,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=CATEGORY_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=CATEGORY_SCHEMA,
-            ),
-        )
-        data = json.loads(response.text)
-        category = data.get("category")
-        return category if category in CATEGORIES else "Другое"
-    except Exception:
-        logger.exception("Ошибка обращения к Gemini API (категория)")
-        return "Другое"
+    category = data.get("category")
+    return category if category in CATEGORIES else "Другое"
 
 
 async def determine_category(description: str) -> str:
@@ -499,34 +593,31 @@ SHOPPING_MATCH_INSTRUCTION = (
 )
 
 
+SHOPPING_MATCH_FORMAT_HINT = '{"matched_numbers": [число, ...]}'
+
+
 async def match_shopping_items_with_gemini(text: str, items: list) -> list:
-    """items — список (id, название). Возвращает id пунктов, которые Gemini
+    """items — список (id, название). Возвращает id пунктов, которые ИИ
     посчитал соответствующими тексту."""
-    if not gemini_client or not items:
+    if not items:
         return []
     numbered = "\n".join(f"{i + 1}. {name}" for i, (_, name) in enumerate(items))
     prompt = f"Список покупок:\n{numbered}\n\nТекст: {text}"
-    try:
-        response = await generate_content_with_retry(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=SHOPPING_MATCH_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=SHOPPING_MATCH_SCHEMA,
-            ),
-        )
-        data = json.loads(response.text)
-        numbers = data.get("matched_numbers", [])
-        matched_ids = []
-        for n in numbers:
-            pos = int(n) - 1
-            if 0 <= pos < len(items):
-                matched_ids.append(items[pos][0])
-        return matched_ids
-    except Exception:
-        logger.exception("Ошибка обращения к Gemini API (сверка списка покупок)")
+    data = await ask_llm_json(
+        SHOPPING_MATCH_INSTRUCTION, prompt, SHOPPING_MATCH_SCHEMA, SHOPPING_MATCH_FORMAT_HINT
+    )
+    if data is None:
         return []
+    numbers = data.get("matched_numbers", [])
+    matched_ids = []
+    for n in numbers:
+        try:
+            pos = int(n) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= pos < len(items):
+            matched_ids.append(items[pos][0])
+    return matched_ids
 
 
 # Быстрый локальный путь для самых очевидных случаев — чтобы не дёргать
@@ -553,27 +644,19 @@ DELETE_ALL_DONE_INSTRUCTION = (
 )
 
 
+DELETE_ALL_DONE_FORMAT_HINT = '{"is_all_done": true/false}'
+
+
 async def is_delete_all_done_request(text: str) -> bool:
     normalized = text.strip(" .").lower()
     if normalized in DELETE_ALL_DONE_WORDS:
         return True
-    if not gemini_client:
+    data = await ask_llm_json(
+        DELETE_ALL_DONE_INSTRUCTION, text, DELETE_ALL_DONE_SCHEMA, DELETE_ALL_DONE_FORMAT_HINT
+    )
+    if data is None:
         return False
-    try:
-        response = await generate_content_with_retry(
-            model=GEMINI_MODEL,
-            contents=text,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=DELETE_ALL_DONE_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=DELETE_ALL_DONE_SCHEMA,
-            ),
-        )
-        data = json.loads(response.text)
-        return bool(data.get("is_all_done", False))
-    except Exception:
-        logger.exception("Ошибка обращения к Gemini API (удаление выполненных)")
-        return False
+    return bool(data.get("is_all_done", False))
 
 
 NOMINATIVE_SCHEMA = genai_types.Schema(
@@ -596,31 +679,84 @@ NOMINATIVE_INSTRUCTION = (
 )
 
 
+NOMINATIVE_FORMAT_HINT = '{"items": ["строка", ...]} — ровно столько же пунктов, в том же порядке'
+
+
 async def normalize_items_to_nominative(items: list) -> list:
     """Приводит названия пунктов списка покупок к именительному падежу через
-    Gemini. При недоступности Gemini или несовпадении количества элементов
-    возвращает исходный список без изменений."""
-    if not gemini_client or not items:
+    ИИ. При недоступности обоих провайдеров или несовпадении количества
+    элементов возвращает исходный список без изменений."""
+    if not items:
         return items
-    try:
-        prompt = "\n".join(f"{i + 1}. {it}" for i, it in enumerate(items))
-        response = await generate_content_with_retry(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=NOMINATIVE_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=NOMINATIVE_SCHEMA,
-            ),
-        )
-        data = json.loads(response.text)
-        normalized = data.get("items", [])
-        if len(normalized) == len(items):
-            return [(n or "").strip() or orig for n, orig in zip(normalized, items)]
+    prompt = "\n".join(f"{i + 1}. {it}" for i, it in enumerate(items))
+    data = await ask_llm_json(NOMINATIVE_INSTRUCTION, prompt, NOMINATIVE_SCHEMA, NOMINATIVE_FORMAT_HINT)
+    if data is None:
         return items
-    except Exception:
-        logger.exception("Ошибка обращения к Gemini API (нормализация списка покупок)")
-        return items
+    normalized = data.get("items", [])
+    if len(normalized) == len(items):
+        return [(n or "").strip() or orig for n, orig in zip(normalized, items)]
+    return items
+
+
+# Фразы-триггеры (BUY_PREFIX_RE/DONE_LIST_PREFIX_RE/DELETE_PREFIX_RE,
+# определены ниже) ловят только фиксированный порядок слов ("удали из
+# списка сыр"). Пользователь может сказать иначе ("удали сыр из списка
+# покупок") — ту же команду, но в свободном порядке. Если сообщение
+# содержит явный намёк на список покупок (корень "списк", "куплен",
+# "купил", "выполнен"), но не совпало ни с одним жёстким шаблоном —
+# спрашиваем ИИ, что имелось в виду, вместо того чтобы требовать от
+# пользователя запоминать точную формулировку.
+SHOPPING_INTENT_HINT_RE = re.compile(r"спис[оа]?к|куплен|купил|выполнен", re.IGNORECASE)
+
+SHOPPING_INTENT_SCHEMA = genai_types.Schema(
+    type=genai_types.Type.OBJECT,
+    properties={
+        "intent": genai_types.Schema(
+            type=genai_types.Type.STRING,
+            enum=["add", "done", "delete", "delete_all_done", "none"],
+        ),
+        "items": genai_types.Schema(
+            type=genai_types.Type.ARRAY, items=genai_types.Schema(type=genai_types.Type.STRING)
+        ),
+    },
+    required=["intent", "items"],
+)
+
+SHOPPING_INTENT_INSTRUCTION = (
+    "Пользователь пишет боту учёта расходов и списка покупок сообщение, которое "
+    "может (а может и не) быть командой по списку покупок — в любом порядке слов "
+    "и свободной формулировке, не только стандартными фразами. Определи intent:\n"
+    "- 'add' — добавить пункт(ы) в список покупок (например 'купить хлеб', "
+    "'добавь в список молоко', 'нужно ещё взять сыр')\n"
+    "- 'done' — отметить пункт(ы) как выполненные/купленные, не удаляя из списка "
+    "(например 'выполнено молоко', 'хлеб куплен', 'я купила сыр')\n"
+    "- 'delete' — удалить конкретные пункт(ы) из списка, независимо от порядка слов "
+    "(например 'удали сыр из списка покупок', 'убери из списка хлеб', "
+    "'сыр больше не нужен в списке')\n"
+    "- 'delete_all_done' — удалить ВСЕ уже выполненные пункты целиком (например "
+    "'удали из списка всё выполненное', 'убери купленное из списка')\n"
+    "- 'none' — сообщение вообще не про список покупок (например обычная трата "
+    "вроде '150 хлеб', или не относится к списку покупок)\n"
+    "В items верни названия товаров, упомянутых в сообщении (пустой список для "
+    "'delete_all_done' и 'none')."
+)
+
+SHOPPING_INTENT_FORMAT_HINT = '{"intent": "add|done|delete|delete_all_done|none", "items": ["строка", ...]}'
+
+
+async def classify_shopping_intent(text: str):
+    """Если сообщение похоже на команду по списку покупок (есть характерный
+    корень), но не совпало с жёсткими фразами-триггерами — спрашивает ИИ,
+    что имелось в виду. Возвращает dict {"intent": ..., "items": [...]}
+    или None, если явно не похоже на команду по списку / ИИ недоступен."""
+    if not SHOPPING_INTENT_HINT_RE.search(text):
+        return None
+    data = await ask_llm_json(
+        SHOPPING_INTENT_INSTRUCTION, text, SHOPPING_INTENT_SCHEMA, SHOPPING_INTENT_FORMAT_HINT
+    )
+    if not data or data.get("intent") not in ("add", "done", "delete", "delete_all_done"):
+        return None
+    return data
 
 
 def fmt(amount: float) -> str:
@@ -823,10 +959,11 @@ async def broadcast_message(text: str, reply_markup=None, parse_mode=None):
 
 
 async def notify_if_shopping_list_cleared():
-    """Если список покупок только что полностью опустел, убирает кнопку
-    "Список покупок" у всех рассылкой."""
+    """Если список покупок только что полностью опустел — сообщает об этом
+    всем рассылкой. Кнопка "Список покупок" теперь часть главного меню и
+    всегда на месте, её не трогаем."""
     if shopping_list_is_empty():
-        await broadcast_message("✅ Список покупок пуст.", reply_markup=ReplyKeyboardRemove())
+        await broadcast_message("✅ Список покупок пуст.")
 
 
 def get_period_day() -> int:
@@ -1034,15 +1171,16 @@ def get_shopping_list():
     return rows
 
 
-def shopping_keyboard(rows=None) -> ReplyKeyboardMarkup:
-    """Клавиатура для списка покупок: кнопка списка всегда, а кнопка
-    "Убрать выполненное" — только если в списке есть вычёркнутые пункты."""
+def shopping_clear_done_markup(rows=None):
+    """Инлайн-кнопка "Убрать выполненное" под списком покупок — только если
+    есть вычёркнутые пункты, иначе None (не трогает главное меню-клавиатуру)."""
     if rows is None:
         rows = get_shopping_list()
-    buttons = [[SHOPPING_LIST_BUTTON_TEXT]]
-    if any(r["done"] for r in rows):
-        buttons.append([REMOVE_DONE_BUTTON_TEXT])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    if not any(r["done"] for r in rows):
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(REMOVE_DONE_BUTTON_TEXT, callback_data=REMOVE_DONE_CALLBACK)]]
+    )
 
 
 def shopping_list_is_empty() -> bool:
@@ -1194,47 +1332,6 @@ def display_name(user) -> str:
 def is_admin(chat_id: int) -> bool:
     return ADMIN_CHAT_ID is not None and chat_id == ADMIN_CHAT_ID
 
-
-def period_day_keyboard(selected_day: int = None) -> InlineKeyboardMarkup:
-    rows = []
-    row = []
-    for day in range(1, 32):
-        label = f"•{day}•" if day == selected_day else str(day)
-        row.append(InlineKeyboardButton(label, callback_data=f"period:{day}"))
-        if len(row) == 7:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
-
-
-async def setperiod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_chat.id):
-        await update.message.reply_text("Команда доступна только администратору.")
-        return
-    current_day = get_period_day()
-    await update.message.reply_text(
-        f"Текущее число начала отчётного периода: {current_day}.\nВыберите новое:",
-        reply_markup=period_day_keyboard(current_day),
-    )
-
-
-async def handle_period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not is_admin(update.effective_user.id):
-        await query.answer("Только администратор может это делать.", show_alert=True)
-        return
-
-    day = int(query.data.split(":")[1])
-    set_period_day(day)
-    period_start = datetime.fromisoformat(current_period_start()).strftime("%d.%m.%Y")
-    await query.edit_message_text(
-        f"Начало отчётного периода: {day}-е число каждого месяца.\n"
-        f"Текущий период начался {period_start}.",
-        reply_markup=period_day_keyboard(day),
-    )
-    await query.answer("Сохранено")
 
 
 def access_request_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -1402,31 +1499,22 @@ HELP_TEXT = (
     "Список покупок:\n"
     "  купить молоко, хлеб и яйца — добавить пункты (текстом или голосом, "
     "через запятую или «и»)\n"
-    "  выполнено по списку молоко, хлеб — отметить пункты выполненными вручную\n"
-    "  удали из списка молоко, хлеб — убрать пункты без отметки о покупке\n"
+    "  выполнено молоко, хлеб / удали сыр из списка покупок — отметить "
+    "выполненным или удалить. Формулировка не обязана быть точной — "
+    "понимает и обычный порядок слов, не только стандартные фразы.\n"
     "  удали из списка выполненные — убрать только уже зачёркнутые пункты\n"
     "При внесении любой траты (текст/голос/фото) бот сам сверяется со списком "
     "и вычёркивает совпавшие пункты. Когда всё куплено — список исчезает.\n\n"
-    "Команды:\n"
-    "/balance — общий остаток (сумма личных бюджетов минус все траты)\n"
-    "/mybudget <сумма> — задать ваш личный бюджет\n"
-    "/mybalance — остаток вашего личного бюджета\n"
-    "/allbudgets — личные бюджеты и остатки всех участников\n"
-    "/today — подробный список расходов за сегодня\n"
-    "/expenses — подробный список расходов за отчётный период\n"
-    "/summary — краткий отчёт по категориям и дням\n"
-    "/categories — итоги по категориям за весь отчётный период\n"
-    "/months — статистика по месяцам и категориям за всё время\n"
-    "/shopping — список запланированных покупок\n\n"
-    "Отчётный период общий для всех и начинается заданного числа каждого месяца "
-    "(настраивается администратором)."
+    "Кнопки ниже — быстрый доступ к расходам, категориям, списку покупок и "
+    "бюджету. Значок рядом с полем ввода открывает мини-приложение — там же "
+    "статистика по месяцам и (для администратора) настройка отчётного периода."
 )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_access(update, context):
         return
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1469,7 +1557,7 @@ async def _cancel_budget_wait_after_timeout(chat_id: int, context: ContextTypes.
         await context.bot.send_message(
             chat_id,
             "⌛ Время на ввод суммы бюджета истекло, отменено.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=MAIN_MENU_KEYBOARD,
         )
     except Exception:
         logger.exception("Не удалось отправить уведомление об истечении таймаута ввода бюджета")
@@ -1781,7 +1869,6 @@ async def save_candidates_and_reply(
     who: str,
     candidates: list,
     failed: list,
-    remove_keyboard: bool = False,
 ):
     """Сохраняет распознанные траты (с учётом лимита личного бюджета) и
     отправляет пользователю сводку. `candidates` — список (tag, amount,
@@ -1832,11 +1919,8 @@ async def save_candidates_and_reply(
     if accepted and remaining is not None:
         reply_lines.append(f"Остаток личного бюджета: {fmt(remaining)}")
 
-    reply_markup = ReplyKeyboardRemove() if remove_keyboard else None
     if reply_lines:
-        await update.message.reply_text("\n".join(reply_lines), reply_markup=reply_markup)
-    elif remove_keyboard:
-        await update.message.reply_text("Хорошо.", reply_markup=reply_markup)
+        await update.message.reply_text("\n".join(reply_lines))
 
     if matched_shopping_items:
         await notify_if_shopping_list_cleared()
@@ -1875,7 +1959,6 @@ async def handle_buy_message(update: Update, who: str, items_text: str):
     lines = "\n".join(f"• {html.escape(i)}" for i in items)
     await broadcast_message(
         f"🛒 {who} добавил(а) в список покупок:\n{lines}",
-        reply_markup=shopping_keyboard(),
         parse_mode=ParseMode.HTML,
     )
 
@@ -1893,10 +1976,7 @@ async def handle_done_list_message(update: Update, items_text: str):
 async def remove_done_shopping_items_and_reply(update: Update):
     deleted = delete_done_shopping_items()
     if deleted:
-        await update.message.reply_text(
-            "Удалены выполненные пункты: " + ", ".join(deleted),
-            reply_markup=shopping_keyboard(),
-        )
+        await update.message.reply_text("Удалены выполненные пункты: " + ", ".join(deleted))
         await notify_if_shopping_list_cleared()
     else:
         await update.message.reply_text("Выполненных пунктов пока нет.")
@@ -1922,11 +2002,12 @@ async def process_expense_text(
     chat_id: int,
     who: str,
     text: str,
-    remove_keyboard: bool = False,
 ):
     """Общая обработка сообщения (текстового или расшифрованного голосового):
-    сначала проверяет команды списка покупок («купить …», «выполнено по
-    списку …»), иначе пытается распознать траты."""
+    сначала проверяет команды списка покупок по фиксированным фразам
+    («купить …», «выполнено по списку …»), затем — свободной формулировкой
+    через ИИ (см. classify_shopping_intent), и только если это вообще не
+    про список покупок — пытается распознать траты."""
     stripped = text.strip()
 
     m = BUY_PREFIX_RE.match(stripped)
@@ -1944,6 +2025,23 @@ async def process_expense_text(
         await handle_delete_from_shopping_message(update, m.group(1))
         return
 
+    intent_data = await classify_shopping_intent(stripped)
+    if intent_data:
+        intent = intent_data["intent"]
+        items_text = ", ".join(intent_data.get("items") or [])
+        if intent == "add" and items_text:
+            await handle_buy_message(update, who, items_text)
+            return
+        if intent == "done" and items_text:
+            await handle_done_list_message(update, items_text)
+            return
+        if intent == "delete" and items_text:
+            await handle_delete_from_shopping_message(update, items_text)
+            return
+        if intent == "delete_all_done":
+            await remove_done_shopping_items_and_reply(update)
+            return
+
     saved = []
     failed = []
     for line in text.splitlines():
@@ -1954,7 +2052,7 @@ async def process_expense_text(
             failed.append(line.strip())
 
     ai_saved = []
-    if failed and gemini_client:
+    if failed and (gemini_client or DEEPSEEK_API_KEY):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception:
@@ -1965,14 +2063,10 @@ async def process_expense_text(
             failed = []
 
     if not saved and not ai_saved and not failed:
-        if remove_keyboard:
-            await update.message.reply_text("Хорошо.", reply_markup=ReplyKeyboardRemove())
         return
 
     candidates = [("✅", a, d) for a, d in saved] + [("🤖", a, d) for a, d in ai_saved]
-    await save_candidates_and_reply(
-        update, chat_id, who, candidates, failed, remove_keyboard=remove_keyboard
-    )
+    await save_candidates_and_reply(update, chat_id, who, candidates, failed)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1983,25 +2077,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     who = display_name(update.effective_user)
     text = update.message.text or ""
 
-    if text.strip() == SHOPPING_LIST_BUTTON_TEXT:
-        await shopping_list_cmd(update, context)
-        return
-
-    if text.strip() == REMOVE_DONE_BUTTON_TEXT:
-        await remove_done_shopping_items_and_reply(update)
+    menu_actions = {
+        MENU_TODAY: today_expenses,
+        MENU_SUMMARY: expenses_summary,
+        MENU_CATEGORIES: category_totals,
+        MENU_SHOPPING: shopping_list_cmd,
+        MENU_BUDGET: all_personal_budgets,
+        MENU_SET_BUDGET: mybudget,
+    }
+    action = menu_actions.get(text.strip())
+    if action:
+        await action(update, context)
         return
 
     if context.user_data.get("awaiting_personal_budget"):
         if text.strip() == CANCEL_TEXT:
             context.user_data.pop("awaiting_personal_budget", None)
-            await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+            await update.message.reply_text("Отменено.", reply_markup=MAIN_MENU_KEYBOARD)
             return
         amount, error = resolve_budget_amount(chat_id, text)
         if amount is not None:
             context.user_data.pop("awaiting_personal_budget", None)
             set_personal_budget(chat_id, amount, who)
             await update.message.reply_text(
-                f"Личный бюджет: {fmt(amount)}.", reply_markup=ReplyKeyboardRemove()
+                f"Личный бюджет: {fmt(amount)}.", reply_markup=MAIN_MENU_KEYBOARD
             )
             return
         # Пока не введут число или не нажмут "Отмена" — остаёмся в режиме
@@ -2106,9 +2205,7 @@ async def shopping_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows = get_shopping_list()
     if not rows:
-        await update.message.reply_text(
-            "Нет запланированных покупок.", reply_markup=ReplyKeyboardRemove()
-        )
+        await update.message.reply_text("Нет запланированных покупок.")
         return
     lines = []
     for i, r in enumerate(rows, 1):
@@ -2117,8 +2214,19 @@ async def shopping_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item_text = f"<s>{item_text}</s>"
         lines.append(item_text)
     await update.message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=shopping_keyboard(rows)
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=shopping_clear_done_markup(rows)
     )
+
+
+async def handle_shopping_clear_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    deleted = delete_done_shopping_items()
+    if deleted:
+        await query.edit_message_text("Удалены выполненные пункты: " + ", ".join(deleted))
+        await notify_if_shopping_list_cleared()
+    else:
+        await query.edit_message_text("Выполненных пунктов пока нет.")
+    await query.answer()
 
 
 async def experimental_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2138,42 +2246,50 @@ async def experimental_report_cmd(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def post_init(app: Application):
-    await app.bot.set_my_commands(
-        [
-            BotCommand("today", "Расходы сегодня"),
-            BotCommand("expenses", "Расходы за отчётный период"),
-            BotCommand("summary", "По дням и категориям"),
-            BotCommand("categories", "Итоги по категориям"),
-            BotCommand("months", "Статистика по месяцам"),
-            BotCommand("shopping", "Что купить"),
-            BotCommand("balance", "Остаток"),
-            BotCommand("mybalance", "Мой остаток"),
-            BotCommand("allbudgets", "Личные бюджеты всех"),
-            BotCommand("mybudget", "Задать личный бюджет"),
-            BotCommand("start", "Помощь"),
-        ]
+async def experimental_miniapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id):
+        await update.message.reply_text("Команда доступна только администратору.")
+        return
+    if not EXPERIMENTAL_MINIAPP_URL:
+        await update.message.reply_text("Мини-приложение сейчас не настроено.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🚀 Открыть мини-приложение", web_app=WebAppInfo(url=EXPERIMENTAL_MINIAPP_URL))]]
     )
+    await update.message.reply_text(
+        "Прототип мини-приложения — дашборд, расходы, категории, список покупок.",
+        reply_markup=keyboard,
+    )
+
+
+async def post_init(app: Application):
+    # Основная навигация теперь — кнопки главного меню (см.
+    # MAIN_MENU_KEYBOARD) и мини-приложение, а не список слэш-команд.
+    # Команды оставлены минимально — как резерв для тех, кто печатает их
+    # руками, плюс специальные админские, которым нет места среди кнопок.
+    await app.bot.set_my_commands([BotCommand("start", "Помощь / главное меню")])
     if ADMIN_CHAT_ID:
         await app.bot.set_my_commands(
             [
-                BotCommand("today", "Расходы сегодня"),
-                BotCommand("expenses", "Расходы за отчётный период"),
-                BotCommand("summary", "По дням и категориям"),
-                BotCommand("categories", "Итоги по категориям"),
-                BotCommand("months", "Статистика по месяцам"),
-                BotCommand("shopping", "Что купить"),
-                BotCommand("balance", "Остаток"),
-                BotCommand("mybalance", "Мой остаток"),
-                BotCommand("allbudgets", "Личные бюджеты всех"),
-                BotCommand("mybudget", "Задать личный бюджет"),
-                BotCommand("setperiod", "Начало периода"),
+                BotCommand("start", "Помощь / главное меню"),
                 BotCommand("pending", "Заявки на доступ"),
-                BotCommand("start", "Помощь"),
                 BotCommand("reportbeta", "🧪 Экспериментально: Отчёт"),
+                BotCommand("miniapp", "Открыть мини-приложение"),
             ],
             scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
         )
+
+    # Кнопка меню (значок рядом с полем ввода) открывает мини-приложение
+    # напрямую, а не список команд — если URL не настроен (например, в
+    # локальной отладке без туннеля), откатываемся на обычное меню команд.
+    if EXPERIMENTAL_MINIAPP_URL:
+        await app.bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Открыть", web_app=WebAppInfo(url=EXPERIMENTAL_MINIAPP_URL)
+            )
+        )
+    else:
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
 
 
 def main():
@@ -2202,7 +2318,6 @@ def main():
     app.add_handler(CommandHandler("mybudget", mybudget))
     app.add_handler(CommandHandler("mybalance", mybalance))
     app.add_handler(CommandHandler("allbudgets", all_personal_budgets))
-    app.add_handler(CommandHandler("setperiod", setperiod_cmd))
     app.add_handler(CommandHandler("today", today_expenses))
     app.add_handler(CommandHandler("expenses", expenses_list))
     app.add_handler(CommandHandler("summary", expenses_summary))
@@ -2211,10 +2326,13 @@ def main():
     app.add_handler(CommandHandler("shopping", shopping_list_cmd))
     app.add_handler(CommandHandler("pending", pending_requests))
     app.add_handler(CommandHandler("reportbeta", experimental_report_cmd))
+    app.add_handler(CommandHandler("miniapp", experimental_miniapp_cmd))
     app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CallbackQueryHandler(handle_access_decision, pattern=r"^(approve|deny):"))
-    app.add_handler(CallbackQueryHandler(handle_period_selection, pattern=r"^period:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_want_own_bot, pattern=r"^want_own_bot$"))
+    app.add_handler(
+        CallbackQueryHandler(handle_shopping_clear_done_callback, pattern=rf"^{REMOVE_DONE_CALLBACK}$")
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))

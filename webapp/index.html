@@ -21,6 +21,7 @@
         <span class="value" id="shared-remaining">—</span>
       </div>
       <div class="sub" id="shared-breakdown">—</div>
+      <div id="per-person-list" class="list per-person-list"></div>
     </section>
 
     <section class="card">
@@ -43,9 +44,14 @@
       </div>
     </section>
 
-    <section class="card">
-      <div class="card-title">Бюджеты всех</div>
-      <div id="all-budgets" class="list"></div>
+    <section class="card hidden" id="period-settings-card">
+      <div class="card-title">Отчётный период (администратор)</div>
+      <div class="sub" id="period-current">—</div>
+      <div class="budget-form">
+        <input id="period-input" type="number" min="1" max="31" placeholder="число месяца (1-31)">
+        <button id="period-submit">Сохранить</button>
+      </div>
+      <div class="hint" id="period-hint"></div>
     </section>
   </main>
 

@@ -94,6 +94,8 @@ button.secondary {
 .hint.error { color: var(--danger); }
 
 .list { display: flex; flex-direction: column; gap: 8px; }
+.per-person-list { margin-top: 10px; }
+.per-person-list:empty { margin-top: 0; }
 .list-row {
   background: var(--card);
   border: 1px solid var(--border);
@@ -121,6 +123,21 @@ button.secondary {
 
 .month-block { margin-bottom: 14px; }
 .month-block h3 { margin: 0 0 6px; font-size: 1rem; text-transform: uppercase; }
+
+.cat-group { display: flex; flex-direction: column; gap: 6px; }
+.cat-row { cursor: pointer; user-select: none; }
+.cat-row .arrow { display: inline-block; width: 1em; color: var(--muted); font-size: 0.8em; }
+.cat-details {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: 14px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+.cat-details.hidden { display: none; }
+.cat-item { background: var(--bg); border-style: dashed; }
+.cat-item .amount { font-weight: 500; }
 
 .shopping-item { text-decoration: none; }
 .shopping-item.done .item-text { text-decoration: line-through; color: var(--muted); }
