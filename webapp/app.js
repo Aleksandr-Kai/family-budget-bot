@@ -199,9 +199,10 @@ async function loadExpenses() {
   totalLine.textContent = "";
 
   try {
-    // "За всё время" + "По категориям" — это и есть разбивка по месяцам
-    // (отдельным блоком на каждый месяц), а не одна общая сумма.
-    if (scope === "all" && mode === "categories") {
+    // "За всё время" — это всегда разбивка по месяцам (отдельным блоком
+    // на каждый месяц), а не одна общая куча; "по категориям"/"подробно"
+    // определяет только то, как показаны траты внутри каждого месяца.
+    if (scope === "all") {
       const data = await api("/api/months");
       if (!data.months.length) {
         list.innerHTML = '<div class="empty">Расходов пока нет</div>';
@@ -215,7 +216,11 @@ async function loadExpenses() {
         block.innerHTML = `<h3>${m.label} — ${fmt(m.total)}</h3>`;
         const monthList = document.createElement("div");
         monthList.className = "list";
-        renderTotalsList(monthList, m.totals);
+        if (mode === "categories") {
+          renderTotalsList(monthList, m.totals);
+        } else {
+          renderExpensesDetailed(monthList, m.items);
+        }
         block.appendChild(monthList);
         list.appendChild(block);
       });

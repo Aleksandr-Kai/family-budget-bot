@@ -280,6 +280,16 @@ def api_months():
             "label": f"{bot.MONTHS_NOM[int(key[5:7]) - 1]} {key[:4]}",
             "totals": _category_totals(by_month[key]),
             "total": sum(r["amount"] for r in by_month[key]),
+            "items": [
+                {
+                    "created_at": r["created_at"],
+                    "amount": r["amount"],
+                    "description": r["description"],
+                    "category": r["category"] or "Другое",
+                    "added_by": r["added_by"],
+                }
+                for r in sorted(by_month[key], key=lambda r: r["created_at"], reverse=True)
+            ],
         }
         for key in order
     ]
