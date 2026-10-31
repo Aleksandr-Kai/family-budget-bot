@@ -1622,27 +1622,31 @@ async def all_personal_budgets(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Личные бюджеты пока никто не задавал.")
         return
 
+    LABEL_WIDTH = 14
+    SEP_W = 24
+
+    def block(title: str, budget: float, spent: float) -> str:
+        return (
+            f"{title}\n"
+            f"{'  Бюджет:':<{LABEL_WIDTH}}{fmt(budget)}\n"
+            f"{'  Потрачено:':<{LABEL_WIDTH}}{fmt(spent)}\n"
+            f"{'  Остаток:':<{LABEL_WIDTH}}{fmt(budget - spent)}"
+        )
+
     period_start = current_period_start()
-    lines = []
+    blocks = []
     total_budget = 0.0
     total_spent = 0.0
     for r in rows:
         spent = get_spent_since_by_chat(r["chat_id"], period_start)
-        remaining = r["amount"] - spent
         who = r["display_name"] or str(r["chat_id"])
-        lines.append(
-            f"{who} · бюджет {fmt(r['amount'])} · потрачено {fmt(spent)} · "
-            f"остаток {fmt(remaining)}"
-        )
+        blocks.append(block(who, r["amount"], spent))
         total_budget += r["amount"]
         total_spent += spent
-    lines.append("")
-    lines.append(
-        f"Итого: бюджет {fmt(total_budget)} · потрачено {fmt(total_spent)} · "
-        f"остаток {fmt(total_budget - total_spent)}"
-    )
+    blocks.append(block("Итого", total_budget, total_spent))
 
-    await update.message.reply_text("\n".join(lines))
+    table = f"\n{'-' * SEP_W}\n".join(blocks)
+    await update.message.reply_text(f"<pre>{table}</pre>", parse_mode=ParseMode.HTML)
 
 
 def build_expense_lines(rows) -> list:
