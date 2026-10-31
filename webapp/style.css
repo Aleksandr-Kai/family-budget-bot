@@ -21,7 +21,7 @@ html, body {
 #app {
   max-width: 480px;
   margin: 0 auto;
-  padding-bottom: 72px;
+  padding-bottom: 100px;
 }
 
 .topbar {
@@ -191,13 +191,14 @@ button.secondary {
   background: none;
   color: var(--muted);
   border-radius: 0;
-  padding: 10px 4px 8px;
+  padding: 16px 4px 14px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
-  font-size: 0.68rem;
+  gap: 4px;
 }
+.nav-btn .nav-icon { font-size: 1.6rem; line-height: 1; }
+.nav-btn .nav-label { font-size: 0.8rem; }
 .nav-btn.active { color: var(--accent); }
 
 .toast {
