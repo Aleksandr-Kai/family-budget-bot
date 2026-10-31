@@ -1236,6 +1236,21 @@ def _delete_shopping_ids(ids: list):
     conn.close()
 
 
+def rename_shopping_item(item_id: int, new_name: str) -> bool:
+    """Переименовывает пункт списка покупок (правка опечатки/формулировки
+    вручную — из мини-приложения). Возвращает False, если пункта с таким
+    id нет или новое название пустое."""
+    new_name = new_name.strip()
+    if not new_name:
+        return False
+    conn = get_conn()
+    cur = conn.execute("UPDATE shopping_list SET item = ? WHERE id = ?", (new_name, item_id))
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
 async def find_matching_shopping_items(text: str) -> list:
     """Ищет невыполненные пункты списка покупок, соответствующие тексту
     (описание траты либо произвольный список). Возвращает список (id, item).

@@ -144,10 +144,27 @@ button.secondary {
 .shopping-item { display: flex; align-items: center; gap: 10px; }
 .shopping-item input[type=checkbox] { width: 20px; height: 20px; }
 .shopping-item .item-text { flex: 1; }
+.shopping-item .edit-btn {
+  background: none;
+  color: var(--muted);
+  padding: 4px 8px;
+}
 .shopping-item .del-btn {
   background: none;
   color: var(--danger);
   padding: 4px 8px;
+}
+.shopping-item .save-btn {
+  color: #fff;
+  padding: 4px 10px;
+}
+.shopping-item .edit-input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
 }
 
 .shopping-form { display: flex; gap: 8px; margin: 10px 0; }

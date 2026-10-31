@@ -285,6 +285,53 @@ async function loadCategories() {
 
 // ---------- Список покупок ----------
 
+function startEditingShoppingItem(row) {
+  const itemId = row.dataset.id;
+  const originalName = row.dataset.name;
+  row.innerHTML = "";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "edit-input";
+  input.value = originalName;
+
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "✓";
+  saveBtn.className = "save-btn";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "✕";
+  cancelBtn.className = "del-btn";
+
+  const save = async () => {
+    const newName = input.value.trim();
+    if (!newName || newName === originalName) {
+      loadShopping();
+      return;
+    }
+    try {
+      await api("/api/shopping/rename", {
+        method: "POST",
+        body: JSON.stringify({ id: Number(itemId), name: newName }),
+      });
+      loadShopping();
+    } catch (e) {
+      showToast(e.message);
+    }
+  };
+
+  saveBtn.addEventListener("click", save);
+  cancelBtn.addEventListener("click", () => loadShopping());
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") save();
+    if (ev.key === "Escape") loadShopping();
+  });
+
+  row.append(input, saveBtn, cancelBtn);
+  input.focus();
+  input.select();
+}
+
 async function loadShopping() {
   const list = document.getElementById("shopping-list");
   try {
@@ -297,38 +344,50 @@ async function loadShopping() {
     data.items.forEach((item) => {
       const row = document.createElement("div");
       row.className = "shopping-item list-row" + (item.done ? " done" : "");
-      row.innerHTML = `
-        <input type="checkbox" ${item.done ? "checked" : ""} data-name="${item.item}">
-        <span class="item-text">${item.item}</span>
-        <button class="del-btn" data-name="${item.item}">✕</button>`;
-      list.appendChild(row);
-    });
+      row.dataset.id = item.id;
+      row.dataset.name = item.item;
 
-    list.querySelectorAll('input[type=checkbox]').forEach((cb) => {
-      cb.addEventListener("change", async () => {
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = item.done;
+      checkbox.addEventListener("change", async () => {
         try {
           await api("/api/shopping/done", {
             method: "POST",
-            body: JSON.stringify({ names: [cb.dataset.name] }),
+            body: JSON.stringify({ names: [row.dataset.name] }),
           });
           loadShopping();
         } catch (e) {
           showToast(e.message);
         }
       });
-    });
-    list.querySelectorAll('.del-btn').forEach((btn) => {
-      btn.addEventListener("click", async () => {
+
+      const text = document.createElement("span");
+      text.className = "item-text";
+      text.textContent = item.item;
+
+      const editBtn = document.createElement("button");
+      editBtn.className = "edit-btn";
+      editBtn.textContent = "✎";
+      editBtn.addEventListener("click", () => startEditingShoppingItem(row));
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "del-btn";
+      delBtn.textContent = "✕";
+      delBtn.addEventListener("click", async () => {
         try {
           await api("/api/shopping/delete", {
             method: "POST",
-            body: JSON.stringify({ names: [btn.dataset.name] }),
+            body: JSON.stringify({ names: [row.dataset.name] }),
           });
           loadShopping();
         } catch (e) {
           showToast(e.message);
         }
       });
+
+      row.append(checkbox, text, editBtn, delBtn);
+      list.appendChild(row);
     });
   } catch (e) {
     showToast(e.message);

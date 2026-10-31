@@ -358,6 +358,22 @@ def api_shopping_delete_done():
     return jsonify({"deleted": deleted})
 
 
+@app.post("/api/shopping/rename")
+@require_auth
+def api_shopping_rename():
+    body = request.get_json(silent=True) or {}
+    try:
+        item_id = int(body.get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "id обязателен"}), 400
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "Название не может быть пустым"}), 400
+    if not bot.rename_shopping_item(item_id, name):
+        return jsonify({"error": "Пункт не найден"}), 404
+    return jsonify({"id": item_id, "name": name})
+
+
 if __name__ == "__main__":
     bot.init_db()
     app.run(host="127.0.0.1", port=8793, debug=bool(DEV_CHAT_ID))
