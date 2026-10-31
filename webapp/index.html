@@ -56,25 +56,19 @@
   </main>
 
   <main id="screen-expenses" class="screen hidden">
-    <div class="tabs">
-      <button class="tab active" data-scope="period">Период</button>
-      <button class="tab" data-scope="today">Сегодня</button>
-    </div>
-    <div class="tabs">
-      <button class="tab active" data-mode="detailed">Подробно</button>
-      <button class="tab" data-mode="categories">По категориям</button>
+    <div class="selects">
+      <select id="expenses-scope-select">
+        <option value="today">Сегодня</option>
+        <option value="period">Текущий период</option>
+        <option value="all">За всё время</option>
+      </select>
+      <select id="expenses-mode-select">
+        <option value="categories">По категориям</option>
+        <option value="detailed">Подробно</option>
+      </select>
     </div>
     <div class="total-line" id="expenses-total"></div>
     <div id="expenses-list" class="list"></div>
-  </main>
-
-  <main id="screen-categories" class="screen hidden">
-    <div class="tabs">
-      <button class="tab active" data-view="period">Текущий период</button>
-      <button class="tab" data-view="months">По месяцам</button>
-    </div>
-    <div id="categories-period"></div>
-    <div id="categories-months" class="hidden"></div>
   </main>
 
   <main id="screen-shopping" class="screen hidden">
@@ -91,7 +85,6 @@
   <nav class="bottom-nav">
     <button class="nav-btn active" data-screen="home"><span class="nav-icon">🏠</span><span class="nav-label">Главная</span></button>
     <button class="nav-btn" data-screen="expenses"><span class="nav-icon">🧾</span><span class="nav-label">Расходы</span></button>
-    <button class="nav-btn" data-screen="categories"><span class="nav-icon">📊</span><span class="nav-label">Категории</span></button>
     <button class="nav-btn" data-screen="shopping"><span class="nav-icon">🛒</span><span class="nav-label">Покупки</span></button>
   </nav>
 

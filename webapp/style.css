@@ -110,14 +110,16 @@ button.secondary {
 .list-row .desc .cat { font-size: 0.75rem; color: var(--muted); }
 .list-row .amount { font-weight: 600; white-space: nowrap; }
 
-.tabs { display: flex; gap: 8px; margin: 10px 0; }
-.tab {
-  background: var(--card);
-  color: var(--muted);
-  border: 1px solid var(--border);
+.selects { display: flex; gap: 8px; margin: 10px 0; }
+.selects select {
   flex: 1;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
 }
-.tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
 .total-line { font-weight: 600; margin-bottom: 8px; }
 

@@ -233,7 +233,12 @@ def api_dashboard():
 @require_auth
 def api_expenses():
     scope = request.args.get("scope", "period")
-    since = bot.datetime.now().strftime("%Y-%m-%dT00:00:00") if scope == "today" else bot.current_period_start()
+    if scope == "today":
+        since = bot.datetime.now().strftime("%Y-%m-%dT00:00:00")
+    elif scope == "all":
+        since = None
+    else:
+        since = bot.current_period_start()
     rows = bot.get_expenses(since)
     items = [
         {

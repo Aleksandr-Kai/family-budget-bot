@@ -37,11 +37,10 @@ function showToast(text) {
 
 // ---------- Навигация ----------
 
-const screens = ["home", "expenses", "categories", "shopping"];
+const screens = ["home", "expenses", "shopping"];
 const titles = {
   home: "Главная",
   expenses: "Расходы",
-  categories: "Категории",
   shopping: "Список покупок",
 };
 
@@ -54,8 +53,7 @@ function showScreen(name) {
   });
   document.getElementById("screen-title").textContent = titles[name];
   if (name === "home") loadDashboard();
-  if (name === "expenses") loadExpenses(currentExpenseScope);
-  if (name === "categories") loadCategories();
+  if (name === "expenses") loadExpenses();
   if (name === "shopping") loadShopping();
 }
 
@@ -159,26 +157,11 @@ document.getElementById("budget-submit").addEventListener("click", async () => {
 
 // ---------- Расходы ----------
 
-let currentExpenseScope = "period";
-let currentExpenseMode = "detailed";
+const expenseScopeSelect = document.getElementById("expenses-scope-select");
+const expenseModeSelect = document.getElementById("expenses-mode-select");
 
-document.querySelectorAll('#screen-expenses [data-scope]').forEach((tab) => {
-  tab.addEventListener("click", () => {
-    document.querySelectorAll('#screen-expenses [data-scope]').forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-    currentExpenseScope = tab.dataset.scope;
-    loadExpenses(currentExpenseScope);
-  });
-});
-
-document.querySelectorAll('#screen-expenses [data-mode]').forEach((tab) => {
-  tab.addEventListener("click", () => {
-    document.querySelectorAll('#screen-expenses [data-mode]').forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-    currentExpenseMode = tab.dataset.mode;
-    loadExpenses(currentExpenseScope);
-  });
-});
+expenseScopeSelect.addEventListener("change", loadExpenses);
+expenseModeSelect.addEventListener("change", loadExpenses);
 
 function groupExpensesByCategory(items) {
   const groups = {};
@@ -191,51 +174,71 @@ function groupExpensesByCategory(items) {
   return Object.values(groups).sort((a, b) => b.amount - a.amount);
 }
 
-async function loadExpenses(scope) {
+function renderExpensesDetailed(container, items) {
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "list-row";
+    const d = new Date(item.created_at);
+    const dateStr = `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    row.innerHTML = `
+      <div class="desc">
+        <span>${item.description}</span>
+        <span class="cat">${item.category} · ${item.added_by || ""} · ${dateStr}</span>
+      </div>
+      <span class="amount">${fmt(item.amount)}</span>`;
+    container.appendChild(row);
+  });
+}
+
+async function loadExpenses() {
+  const scope = expenseScopeSelect.value;
+  const mode = expenseModeSelect.value;
   const list = document.getElementById("expenses-list");
+  const totalLine = document.getElementById("expenses-total");
   list.innerHTML = "";
+  totalLine.textContent = "";
+
   try {
+    // "За всё время" + "По категориям" — это и есть разбивка по месяцам
+    // (отдельным блоком на каждый месяц), а не одна общая сумма.
+    if (scope === "all" && mode === "categories") {
+      const data = await api("/api/months");
+      if (!data.months.length) {
+        list.innerHTML = '<div class="empty">Расходов пока нет</div>';
+        return;
+      }
+      let grandTotal = 0;
+      data.months.slice().reverse().forEach((m) => {
+        grandTotal += m.total;
+        const block = document.createElement("div");
+        block.className = "month-block";
+        block.innerHTML = `<h3>${m.label} — ${fmt(m.total)}</h3>`;
+        const monthList = document.createElement("div");
+        monthList.className = "list";
+        renderTotalsList(monthList, m.totals);
+        block.appendChild(monthList);
+        list.appendChild(block);
+      });
+      totalLine.textContent = `Итого: ${fmt(grandTotal)}`;
+      return;
+    }
+
     const data = await api(`/api/expenses?scope=${scope}`);
-    document.getElementById("expenses-total").textContent = `Итого: ${fmt(data.total)}`;
+    totalLine.textContent = `Итого: ${fmt(data.total)}`;
     if (!data.items.length) {
       list.innerHTML = '<div class="empty">Расходов пока нет</div>';
       return;
     }
 
-    if (currentExpenseMode === "categories") {
+    if (mode === "categories") {
       renderTotalsList(list, groupExpensesByCategory(data.items));
-      return;
+    } else {
+      renderExpensesDetailed(list, data.items);
     }
-
-    data.items.forEach((item) => {
-      const row = document.createElement("div");
-      row.className = "list-row";
-      const d = new Date(item.created_at);
-      const dateStr = `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-      row.innerHTML = `
-        <div class="desc">
-          <span>${item.description}</span>
-          <span class="cat">${item.category} · ${item.added_by || ""} · ${dateStr}</span>
-        </div>
-        <span class="amount">${fmt(item.amount)}</span>`;
-      list.appendChild(row);
-    });
   } catch (e) {
     showToast(e.message);
   }
 }
-
-// ---------- Категории ----------
-
-document.querySelectorAll('#screen-categories .tab').forEach((tab) => {
-  tab.addEventListener("click", () => {
-    document.querySelectorAll('#screen-categories .tab').forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-    const view = tab.dataset.view;
-    document.getElementById("categories-period").classList.toggle("hidden", view !== "period");
-    document.getElementById("categories-months").classList.toggle("hidden", view !== "months");
-  });
-});
 
 function renderTotalsList(container, totals) {
   container.innerHTML = "";
