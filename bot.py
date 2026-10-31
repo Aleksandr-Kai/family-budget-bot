@@ -277,7 +277,7 @@ CANCEL_KEYBOARD = ReplyKeyboardMarkup(
 # после /start и восстанавливается после временных клавиатур (отмена ввода
 # бюджета и т.п.), чтобы не пропадала.
 MENU_TODAY = "📅 Расходы сегодня"
-MENU_SUMMARY = "📋 Расходы за период"
+MENU_SUMMARY = "📋 Расходы по дням"
 MENU_CATEGORIES = "📊 Итоги по категориям"
 MENU_SHOPPING = "🛒 Список покупок"
 MENU_BUDGET = "💰 Бюджет"
