@@ -231,9 +231,24 @@ document.getElementById("budget-submit").addEventListener("click", async () => {
 
 const expenseScopeSelect = document.getElementById("expenses-scope-select");
 const expenseModeSelect = document.getElementById("expenses-mode-select");
+const expenseDateInput = document.getElementById("expenses-date-input");
 
-expenseScopeSelect.addEventListener("change", loadExpenses);
+function todayIso() {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+expenseScopeSelect.addEventListener("change", () => {
+  expenseDateInput.classList.toggle("hidden", expenseScopeSelect.value !== "date");
+  if (expenseScopeSelect.value === "date" && !expenseDateInput.value) {
+    expenseDateInput.value = todayIso();
+  }
+  loadExpenses();
+});
 expenseModeSelect.addEventListener("change", loadExpenses);
+expenseDateInput.addEventListener("change", loadExpenses);
 
 function groupExpensesByCategory(items) {
   const groups = {};
@@ -300,7 +315,12 @@ async function loadExpenses() {
       return;
     }
 
-    const data = await api(`/api/expenses?scope=${scope}`);
+    if (scope === "date" && !expenseDateInput.value) {
+      list.innerHTML = '<div class="empty">Выберите дату</div>';
+      return;
+    }
+    const dateParam = scope === "date" ? `&date=${expenseDateInput.value}` : "";
+    const data = await api(`/api/expenses?scope=${scope}${dateParam}`);
     totalLine.textContent = `Итого: ${fmt(data.total)}`;
     if (!data.items.length) {
       list.innerHTML = '<div class="empty">Расходов пока нет</div>';

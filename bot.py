@@ -9,7 +9,7 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from dotenv import load_dotenv
@@ -1156,19 +1156,25 @@ def add_expense(chat_id: int, added_by: str, amount: float, description: str, ca
     conn.close()
 
 
-def get_expenses(since: str = None):
+def get_expenses(since: str = None, until: str = None):
     conn = get_conn()
     base_query = (
         "SELECT e.amount, e.description, e.added_by, e.created_at, c.name AS category "
         "FROM expenses e LEFT JOIN categories c ON e.category_id = c.id "
     )
+    conditions = []
+    params = []
     if since:
-        rows = conn.execute(
-            base_query + "WHERE e.created_at >= ? ORDER BY e.created_at",
-            (since,),
-        ).fetchall()
-    else:
-        rows = conn.execute(base_query + "ORDER BY e.created_at").fetchall()
+        conditions.append("e.created_at >= ?")
+        params.append(since)
+    if until:
+        conditions.append("e.created_at < ?")
+        params.append(until)
+    query = base_query
+    if conditions:
+        query += "WHERE " + " AND ".join(conditions) + " "
+    query += "ORDER BY e.created_at"
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return rows
 

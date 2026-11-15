@@ -133,6 +133,17 @@ button.secondary {
   font-size: 0.9rem;
 }
 
+#expenses-date-input {
+  width: 100%;
+  margin: 0 0 10px;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
+}
+
 .total-line { font-weight: 600; margin-bottom: 8px; }
 
 .month-block { margin-bottom: 14px; }

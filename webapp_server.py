@@ -284,13 +284,22 @@ def api_dashboard():
 @require_auth
 def api_expenses():
     scope = request.args.get("scope", "period")
+    until = None
     if scope == "today":
         since = bot.datetime.now().strftime("%Y-%m-%dT00:00:00")
     elif scope == "all":
         since = None
+    elif scope == "date":
+        raw_date = request.args.get("date", "")
+        try:
+            day = bot.datetime.strptime(raw_date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "date должен быть в формате YYYY-MM-DD"}), 400
+        since = day.strftime("%Y-%m-%dT00:00:00")
+        until = (day + bot.timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
     else:
         since = bot.current_period_start()
-    rows = bot.get_expenses(since)
+    rows = bot.get_expenses(since, until)
     items = [
         {
             "created_at": r["created_at"],
